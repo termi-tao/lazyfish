@@ -1,0 +1,872 @@
+"""Command line interface. The only module that writes to the terminal.
+
+Output discipline, because it is load-bearing for scripting and for AC6:
+
+* stdout carries the result of the command - the prepared block, the status
+  table, the plan summary. It is deterministic: running `prep` again for an
+  already prepared ticket reproduces byte-identical stdout.
+* stderr carries everything else - candidate listings, warnings, progress, the
+  attachment download notice. All of it depends on the state of the tracker at
+  the moment of the call, so none of it belongs in the deterministic stream.
+
+The last line of a successful `prep` is a bare `cd <path>`, so that
+`eval "$(lazyfish prep | tail -1)"` works.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+import click
+
+from . import __version__
+from .config import (
+    DEFAULT_CONVENTIONS_PATH,
+    DEFAULT_EMAIL_ENV,
+    DEFAULT_TOKEN_ENV,
+    Config,
+    RepoProfile,
+    load_config,
+)
+from .db import (
+    STATE_ABANDONED,
+    STATE_READY_FOR_PLAN,
+    Database,
+    Task,
+    open_db,
+)
+from .errors import LazyfishError
+from .keywords import extract_keywords
+from .paths import config_path, db_path
+from .schema import PlanIssue, load_plan, validate_plan
+from .trackers import build_client
+from .trackers.base import Ticket
+from .workspace import (
+    PLAN_FILENAME,
+    PROMPT_FILENAME,
+    STATE_DIRNAME,
+    AttachmentPlan,
+    Worktree,
+    collect_hints,
+    create_worktree,
+    download_attachments,
+    plan_attachments,
+    read_conventions,
+    remove_worktree,
+    render_context,
+    write_ticket_json,
+)
+
+CONFIG_TEMPLATE = """# lazyfish configuration.
+#
+# Secrets are never stored here. lazyfish reads your account email from
+# $LAZYFISH_EMAIL and your API token from $LAZYFISH_TOKEN at call time, and
+# refuses to start if it finds something that looks like a credential in this
+# file.
+#
+# To read them from differently named variables - two tracker instances, two
+# sets of credentials - add the names here:
+#     email_env = "OTHER_EMAIL_VAR"
+#     token_env = "OTHER_TOKEN_VAR"
+
+[tracker]
+kind = "jira-cloud"
+base_url = {base_url}
+query = {query}
+
+[repo.{profile}]
+path = {repo_path}
+# Injected verbatim into the prepared context. May be an absolute path if you
+# cannot commit a file to the repository.
+conventions = {conventions}
+# Optional: narrows the mechanical code search.
+# search_globs = ["*.py", "*.ts"]
+{account_note}"""
+
+DEFAULT_QUERY = (
+    "assignee = currentUser() AND statusCategory != Done ORDER BY priority DESC, created ASC"
+)
+
+# Matches what people paste when they read "repository": a clone URL. The single
+# slash is not a typo - click.Path and Path() both collapse "https://" to
+# "https:/", so the check has to accept the collapsed form too.
+REMOTE_URL_RE = re.compile(r"^(?:https?|ssh|git|git\+ssh)://?|^git@|^[\w.-]+:[\w./-]+\.git$")
+
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+
+def out(message: str = "") -> None:
+    """Deterministic result stream."""
+    click.echo(message)
+
+
+def note(message: str) -> None:
+    """Informational, non-deterministic stream."""
+    click.echo(message, err=True)
+
+
+def warn(message: str) -> None:
+    click.echo(f"warning: {message}", err=True)
+
+
+def _field(label: str, value: str) -> str:
+    return f"  {label:<18}{value}"
+
+
+# --------------------------------------------------------------------------- #
+# Shared plumbing
+# --------------------------------------------------------------------------- #
+
+
+def _config(ctx: click.Context, *, require_credentials: bool = True) -> Config:
+    override = ctx.obj.get("config_path")
+    return load_config(override, require_credentials=require_credentials)
+
+
+def _profile(ctx: click.Context, config: Config) -> RepoProfile:
+    return config.repo(ctx.obj.get("repo"))
+
+
+def _database(ctx: click.Context) -> Database:
+    path = ctx.obj.get("db_path") or db_path()
+    database = Database(path)
+    database.initialise()
+    return database
+
+
+def _worktree_of(task: Task) -> Worktree:
+    """Rebuild the Worktree description from a stored row."""
+    return Worktree(
+        path=Path(task.worktree_path),
+        branch=task.branch,
+        artifacts_dir=Path(task.artifacts_path),
+        created=False,
+    )
+
+
+def _prepared_block(profile: RepoProfile, task: Task, missing_conventions: Path | None) -> str:
+    """The deterministic stdout of `prep`, also reprinted on a repeat run."""
+    worktree = Path(task.worktree_path)
+    lines = [
+        f"Prepared {task.ticket_key}: {task.ticket_title}",
+        _field("repo profile", profile.name),
+        _field("branch", task.branch),
+        _field("worktree", str(worktree)),
+        _field("context", str(worktree / "CLAUDE.md")),
+        _field("design brief", str(worktree / STATE_DIRNAME / PROMPT_FILENAME)),
+        _field("write plan to", str(worktree / STATE_DIRNAME / PLAN_FILENAME)),
+    ]
+    if profile.account_note:
+        lines.append(_field("account note", profile.account_note))
+    if missing_conventions is not None:
+        lines.append(
+            _field(
+                "conventions",
+                f"not found at {missing_conventions} - the project conventions "
+                f"section was left out of CLAUDE.md",
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "Open the worktree, run the AI tool of your choice, then "
+            "'lazyfish show' and 'lazyfish accept'.",
+            f"cd {worktree}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _missing_conventions(profile: RepoProfile) -> Path | None:
+    path, text = read_conventions(profile)
+    return path if (path is not None and text is None) else None
+
+
+# --------------------------------------------------------------------------- #
+# Root group
+# --------------------------------------------------------------------------- #
+
+
+class LazyfishGroup(click.Group):
+    """Converts LazyfishError into a click error before it can become a traceback.
+
+    Doing it here rather than only in `main` means the same behaviour applies
+    when the group is invoked programmatically, which is how the tests check
+    that no failure path ever shows a stack trace (AC13).
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except LazyfishError as exc:
+            error = click.ClickException(str(exc))
+            error.exit_code = exc.exit_code
+            raise error from exc
+
+
+@click.group(cls=LazyfishGroup, context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(__version__, prog_name="lazyfish")
+@click.option(
+    "--repo",
+    "repo",
+    default=None,
+    metavar="PROFILE",
+    help="Repo profile from the config file. Defaults to 'default'.",
+)
+@click.option(
+    "--config",
+    "config_file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to config.toml. Defaults to the standard location.",
+)
+@click.pass_context
+def cli(ctx: click.Context, repo: str | None, config_file: Path | None) -> None:
+    """Turn a tracker ticket into a prepared git worktree, and record what came back.
+
+    lazyfish never calls a model and never launches an AI tool. It prepares
+    context, gets out of the way, then validates and records the result.
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["repo"] = repo
+    ctx.obj["config_path"] = config_file
+
+
+# --------------------------------------------------------------------------- #
+# init
+# --------------------------------------------------------------------------- #
+
+
+def _toml_string(value: str) -> str:
+    """TOML basic strings share JSON's escaping rules."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+@cli.command()
+@click.option("--base-url", default=None, help="Atlassian site base URL.")
+@click.option(
+    "--email",
+    default=None,
+    help="Atlassian account email. Used only to print the export line for you; "
+    "it is never written to the config file.",
+)
+@click.option("--query", default=None, help="JQL query selecting candidate tickets.")
+@click.option("--profile", default="default", show_default=True, help="Repo profile name.")
+@click.option(
+    "--repo-path",
+    default=None,
+    metavar="PATH",
+    help="Local path to the target git repository.",
+)
+@click.option("--account-note", default=None, help="Reminder printed by every prep.")
+@click.option("--force", is_flag=True, help="Overwrite an existing config file.")
+@click.option(
+    "--write-conventions/--no-write-conventions",
+    default=None,
+    help="Copy the conventions example into the target repository.",
+)
+@click.option("--check/--no-check", default=None, help="Run a tracker connectivity check.")
+@click.option("--yes", is_flag=True, help="Do not prompt; use the given options.")
+@click.pass_context
+def init(
+    ctx: click.Context,
+    base_url: str | None,
+    email: str | None,
+    query: str | None,
+    profile: str,
+    repo_path: str | None,
+    account_note: str | None,
+    force: bool,
+    write_conventions: bool | None,
+    check: bool | None,
+    yes: bool,
+) -> None:
+    """Create the configuration file and the local database."""
+    target = ctx.obj.get("config_path") or config_path()
+    if target.exists() and not force:
+        raise LazyfishError(f"{target} already exists. Edit it, or pass --force to overwrite it.")
+
+    interactive = not yes
+    if interactive:
+        note("lazyfish init: six answers and you are configured.\n")
+        # The wording of the five specified questions is not improvised; the
+        # profile name is the sixth. What the wizard deliberately does not ask is
+        # which environment variables to use: see DEFAULT_EMAIL_ENV in config.py.
+        # No default here on purpose: the example belongs in the question, and
+        # accepting "your-org" on an empty Enter would write a config that points
+        # nowhere and fail much later, as a connection error.
+        while not base_url:
+            answer = click.prompt(
+                "Atlassian site base URL (e.g. https://your-org.atlassian.net)"
+            ).strip()
+            if answer.startswith(("http://", "https://")):
+                base_url = answer
+            else:
+                warn("that should start with https:// - try again")
+        email = email or click.prompt("Atlassian account email (the one you log in to Jira with)")
+        query = query or click.prompt(
+            "JQL query for selecting candidate tickets", default=DEFAULT_QUERY
+        )
+        profile = click.prompt("Name for this repo profile", default=profile)
+        repo_path = repo_path or click.prompt(
+            "Local path to the target git repository (not a remote URL)", type=str
+        )
+        if account_note is None:
+            account_note = (
+                click.prompt(
+                    "Optional reminder to print on every prep (blank for none)",
+                    default="",
+                    show_default=False,
+                )
+                or None
+            )
+    if not base_url or not repo_path:
+        raise LazyfishError("--base-url and --repo-path are required when running with --yes.")
+
+    raw_repo = str(repo_path).strip()
+    if REMOTE_URL_RE.match(raw_repo):
+        raise LazyfishError(
+            f"{raw_repo} is a remote URL, not a local path.\n"
+            f"lazyfish creates git worktrees, so it needs a checkout that already "
+            f"exists on this machine, for example ~/dev/your-repo.\n"
+            f"Clone it first, then point lazyfish at the clone."
+        )
+
+    resolved_repo = Path(raw_repo).expanduser()
+    if not (resolved_repo / ".git").exists():
+        raise LazyfishError(
+            f"{resolved_repo} is not a git repository (no .git found). "
+            f"lazyfish creates worktrees, so it needs a real checkout."
+        )
+
+    body = CONFIG_TEMPLATE.format(
+        base_url=_toml_string(base_url.rstrip("/")),
+        query=_toml_string(query or DEFAULT_QUERY),
+        profile=profile,
+        repo_path=_toml_string(str(resolved_repo)),
+        conventions=_toml_string(DEFAULT_CONVENTIONS_PATH),
+        account_note=(f"account_note = {_toml_string(account_note)}\n" if account_note else ""),
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    out(f"Wrote {target}")
+
+    database_path = ctx.obj.get("db_path") or db_path()
+    with open_db(database_path):
+        pass
+    out(f"Initialised database {database_path}")
+
+    if write_conventions is None and interactive:
+        write_conventions = click.confirm(
+            f"Copy the conventions example to {resolved_repo}/{DEFAULT_CONVENTIONS_PATH}?",
+            default=False,
+        )
+    if write_conventions:
+        destination = resolved_repo / DEFAULT_CONVENTIONS_PATH
+        if destination.exists():
+            warn(f"{destination} already exists; left untouched.")
+        else:
+            example = (Path(__file__).parent / "templates" / "conventions.example.md").read_text(
+                encoding="utf-8"
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(example, encoding="utf-8")
+            out(f"Wrote {destination} - replace its contents with your own rules.")
+
+    out("")
+    out("Two credentials still need to be in your environment. lazyfish reads them")
+    out("from there on every call and never stores them:")
+    out("")
+    out(f"    export {DEFAULT_EMAIL_ENV}='{email or 'you@example.com'}'")
+    out(f"    export {DEFAULT_TOKEN_ENV}='<your API token>'")
+    out("")
+    out("Create the token at id.atlassian.com -> Security -> API tokens. Add both")
+    out("exports to your shell profile so they survive a new terminal, then run:")
+    out("")
+    out("    lazyfish prep")
+
+    # Only offer the check when the credentials are already present. Immediately
+    # after a first-run wizard they are not, and a check that is certain to fail
+    # teaches the user nothing.
+    credentials_present = all(
+        os.environ.get(name) for name in (DEFAULT_EMAIL_ENV, DEFAULT_TOKEN_ENV)
+    )
+    if check is None and interactive and credentials_present:
+        check = click.confirm("\nCheck the tracker connection now?", default=True)
+    if check:
+        _connectivity_check(ctx)
+
+
+def _connectivity_check(ctx: click.Context) -> None:
+    """Fetch one ticket and show how it was parsed.
+
+    Worth the extra command: an instance with unusual field configuration should
+    fail here, with the parsed values on screen, rather than midway through the
+    first prep (R5).
+    """
+    note("")
+    try:
+        config = _config(ctx)
+        client = build_client(config.tracker)
+    except LazyfishError as exc:
+        warn(f"connectivity check skipped: {exc}")
+        return
+    try:
+        candidates = client.list_candidates(limit=1)
+    except LazyfishError as exc:
+        warn(f"connectivity check failed: {exc}")
+        return
+    finally:
+        client.close()
+
+    if not candidates:
+        note("Connection works, but the query matched no tickets.")
+        return
+    ticket = candidates[0]
+    note("Connection works. First candidate parsed as:")
+    note(f"  key      : {ticket.key}")
+    note(f"  title    : {ticket.title}")
+    note(f"  status   : {ticket.status}")
+    note(f"  priority : {ticket.priority}")
+    note(f"  assignee : {ticket.assignee}")
+
+
+# --------------------------------------------------------------------------- #
+# prep
+# --------------------------------------------------------------------------- #
+
+
+@cli.command()
+@click.option("--ticket", "ticket_key", default=None, help="Prepare this ticket key.")
+@click.option("--limit", default=5, show_default=True, help="Candidates to list.")
+@click.option("--no-hints", is_flag=True, help="Skip the mechanical code search.")
+@click.pass_context
+def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool) -> None:
+    """Pick a ticket, build its worktree, and write the context files."""
+    config = _config(ctx)
+    profile = _profile(ctx, config)
+
+    with _database(ctx) as database:
+        active = database.get_in_flight(profile.name)
+        if active is not None:
+            _handle_active(profile, active)
+            return
+
+        client = build_client(config.tracker)
+        try:
+            candidates = client.list_candidates(limit=limit)
+            if ticket_key:
+                was_top_pick = bool(candidates) and candidates[0].key == ticket_key
+            else:
+                if not candidates:
+                    raise LazyfishError(
+                        "The tracker query matched no tickets.\n"
+                        "Check the [tracker] query in your config, or pass "
+                        "--ticket <KEY> to prepare a specific one."
+                    )
+                ticket_key = candidates[0].key
+                was_top_pick = True
+
+            _print_candidates(candidates, ticket_key)
+            note(f"Fetching {ticket_key} ...")
+            ticket = client.fetch(ticket_key)
+
+            worktree = create_worktree(profile, ticket.key)
+            write_ticket_json(worktree, ticket)
+
+            attachment_plan = plan_attachments(ticket, config.tracker)
+            _print_attachment_plan(attachment_plan)
+            attachments = download_attachments(client, worktree, attachment_plan)
+        finally:
+            client.close()
+
+        conventions_path, conventions_text = read_conventions(profile)
+        terms = extract_keywords(
+            ticket.title,
+            ticket.description,
+            *[comment.body for comment in ticket.comments],
+        )
+        hints = collect_hints(profile, worktree, terms, enabled=not no_hints)
+
+        render_context(
+            worktree=worktree,
+            profile=profile,
+            ticket=ticket,
+            attachments=attachments,
+            hints=hints,
+            conventions_text=conventions_text,
+            conventions_path=conventions_path,
+        )
+
+        task = database.insert_task(
+            ticket_key=ticket.key,
+            ticket_title=ticket.title,
+            repo_profile=profile.name,
+            branch=worktree.branch,
+            worktree_path=str(worktree.path),
+            artifacts_path=str(worktree.artifacts_dir),
+            was_top_pick=was_top_pick,
+        )
+
+    missing = conventions_path if conventions_text is None else None
+    out(_prepared_block(profile, task, missing))
+
+
+def _handle_active(profile: RepoProfile, active: Task) -> None:
+    """Repeat run: change nothing, reproduce the same stdout (AC6, AC7).
+
+    The explanation goes to stderr precisely so that stdout stays identical to
+    the first run and a script wrapping `prep` keeps working.
+    """
+    note(
+        f"{active.ticket_key} is already prepared for profile "
+        f"'{profile.name}' and is waiting for its plan; nothing to do."
+    )
+    out(_prepared_block(profile, active, _missing_conventions(profile)))
+
+
+def _print_candidates(candidates: list[Ticket], chosen: str) -> None:
+    if not candidates:
+        return
+    note(f"Candidates ({len(candidates)}):")
+    for index, candidate in enumerate(candidates, start=1):
+        marker = "*" if candidate.key == chosen else " "
+        priority = candidate.priority or "-"
+        note(f" {marker} {index}. {candidate.key}  [{priority}]  {candidate.title}")
+    if not any(candidate.key == chosen for candidate in candidates):
+        note(f" * {chosen} (chosen explicitly, not in the candidate list)")
+
+
+def _print_attachment_plan(plan: AttachmentPlan) -> None:
+    for attachment, reason in plan.skipped:
+        note(f"Attachment not downloaded: {attachment.filename} ({reason})")
+    if plan.to_inline:
+        names = ", ".join(item.filename for item in plan.to_inline)
+        note(f"Downloading attachment(s) into the worktree: {names}")
+
+
+# --------------------------------------------------------------------------- #
+# show
+# --------------------------------------------------------------------------- #
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Print the raw plan as JSON.")
+@click.pass_context
+def show(ctx: click.Context, as_json: bool) -> None:
+    """Print the current plan and highlight what still needs a decision."""
+    config = _config(ctx, require_credentials=False)
+    profile = _profile(ctx, config)
+
+    with _database(ctx) as database:
+        task = database.get_in_flight(profile.name)
+        if task is None:
+            raise LazyfishError(
+                f"No ticket awaiting a plan for profile '{profile.name}'. "
+                f"Run 'lazyfish prep' first."
+            )
+        worktree = _worktree_of(task)
+        plan = load_plan(worktree.plan_path)
+
+        if as_json:
+            out(json.dumps(plan, ensure_ascii=False, indent=2))
+            return
+
+        issues = validate_plan(plan, worktree.path)
+        out(f"{task.ticket_key}: {task.ticket_title}")
+        out(_field("plan", str(worktree.plan_path)))
+        out(_field("confidence", str(plan.get("confidence", "unstated"))))
+        out(_field("needs human", str(plan.get("needs_human", "unstated"))))
+        out("")
+
+        understanding = plan.get("understanding")
+        if isinstance(understanding, str) and understanding.strip():
+            out("Understanding")
+            out(f"  {understanding.strip()}")
+            out("")
+
+        _print_list(
+            "Open questions",
+            [
+                f"[{'blocking' if item.get('blocking') else 'non-blocking'}] {item.get('text', '')}"
+                for item in plan.get("open_questions", [])
+                if isinstance(item, dict)
+            ],
+        )
+        _print_list(
+            "Assumptions",
+            [item for item in plan.get("assumptions", []) if isinstance(item, str)],
+        )
+        _print_list(
+            "Changes",
+            [
+                f"{item.get('action', '?'):<7}{item.get('file', '?')}"
+                + (
+                    f"  (confidence: {item['confidence']})"
+                    if item.get("confidence") in ("low", "medium")
+                    else ""
+                )
+                for item in plan.get("changes", [])
+                if isinstance(item, dict)
+            ],
+        )
+        _print_list(
+            "Acceptance criteria",
+            [item for item in plan.get("acceptance_criteria", []) if isinstance(item, str)],
+        )
+
+        if issues:
+            out(f"Validation: {len(issues)} problem(s). 'lazyfish accept' will refuse:")
+            for issue in issues:
+                out(f"  {issue}")
+        else:
+            out("Validation: passes. Run 'lazyfish accept' to record the outcome.")
+
+
+def _print_list(heading: str, items: list[str]) -> None:
+    if not items:
+        return
+    out(heading)
+    for item in items:
+        out(f"  - {item}")
+    out("")
+
+
+# --------------------------------------------------------------------------- #
+# accept
+# --------------------------------------------------------------------------- #
+
+
+@cli.command()
+@click.option("--as-is", "as_is", is_flag=True, help="Record the plan as accepted unchanged.")
+@click.option(
+    "--modified",
+    "modified",
+    is_flag=True,
+    help="Record that the plan needed changes; use --note to say what.",
+)
+@click.option("--note", "note_text", default=None, help="Free text stored with the task.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Accept despite validation errors. Recorded in the task notes.",
+)
+@click.pass_context
+def accept(
+    ctx: click.Context,
+    as_is: bool,
+    modified: bool,
+    note_text: str | None,
+    force: bool,
+) -> None:
+    """Validate the plan and record whether it was taken as written."""
+    if as_is and modified:
+        raise LazyfishError("--as-is and --modified contradict each other.")
+
+    config = _config(ctx, require_credentials=False)
+    profile = _profile(ctx, config)
+
+    with _database(ctx) as database:
+        # get_in_flight only ever returns a READY_FOR_PLAN task, so a plan that
+        # has already been recorded cannot be accepted twice.
+        task = database.get_in_flight(profile.name)
+        if task is None:
+            recorded = database.get_open(profile.name)
+            if recorded is not None:
+                raise LazyfishError(
+                    f"The plan for {recorded.ticket_key} was already recorded on "
+                    f"{recorded.accepted_at}. Run 'lazyfish prep' to start the next "
+                    f"ticket."
+                )
+            raise LazyfishError(
+                f"No ticket awaiting a plan for profile '{profile.name}'. "
+                f"Run 'lazyfish prep' first."
+            )
+
+        worktree = _worktree_of(task)
+        plan = load_plan(worktree.plan_path)
+        issues = validate_plan(plan, worktree.path)
+
+        if issues and not force:
+            _report_issues(issues, worktree.plan_path)
+            ctx.exit(6)
+
+        plan_ticket = plan.get("ticket")
+        if isinstance(plan_ticket, str) and plan_ticket != task.ticket_key:
+            warn(
+                f"the plan names ticket {plan_ticket}, but the task in flight is {task.ticket_key}."
+            )
+
+        if as_is:
+            accepted, notes = True, note_text
+        elif modified:
+            accepted, notes = False, note_text
+        else:
+            accepted = click.confirm(
+                f"Accept the plan for {task.ticket_key} exactly as written?",
+                default=True,
+            )
+            if accepted:
+                notes = note_text
+            else:
+                notes = note_text or click.prompt(
+                    "What did you change, or what was missing?", default="", show_default=False
+                )
+
+        task = database.mark_accepted(task.id, plan_accepted=accepted, notes=notes or None)
+        if issues and force:
+            task = database.append_note(
+                task.id, f"schema bypassed: {len(issues)} unresolved validation issue(s)"
+            )
+            warn("plan accepted with --force; the bypass is recorded in the task notes.")
+
+        verdict = "as written" if accepted else "with changes"
+        out(f"Recorded {task.ticket_key} as accepted {verdict}.")
+        minutes = task.minutes_to_accept()
+        if minutes is not None:
+            out(_field("prep to accept", f"{minutes:.1f} minutes"))
+        if task.notes:
+            out(_field("notes", task.notes))
+        out(_field("worktree", task.worktree_path))
+
+
+def _report_issues(issues: list[PlanIssue], plan_path: Path) -> None:
+    note(f"{plan_path} does not pass validation ({len(issues)} problem(s)):")
+    for issue in issues:
+        note(f"  {issue}")
+    note("")
+    note("Fix the plan and run 'lazyfish accept' again, or use --force to accept it")
+    note("anyway; a forced accept is recorded in the task notes.")
+
+
+# --------------------------------------------------------------------------- #
+# abandon
+# --------------------------------------------------------------------------- #
+
+
+@cli.command()
+@click.option("--note", "note_text", default=None, help="Why the ticket was dropped.")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@click.pass_context
+def abandon(ctx: click.Context, note_text: str | None, yes: bool) -> None:
+    """Drop the ticket in flight: remove its worktree and branch."""
+    config = _config(ctx, require_credentials=False)
+    profile = _profile(ctx, config)
+
+    with _database(ctx) as database:
+        task = database.get_open(profile.name)
+        if task is None:
+            raise LazyfishError(
+                f"No ticket in flight for profile '{profile.name}'; nothing to abandon."
+            )
+        if not yes:
+            click.confirm(
+                f"Abandon {task.ticket_key} and delete {task.worktree_path} "
+                f"and branch {task.branch}?",
+                abort=True,
+            )
+        log = remove_worktree(profile, Path(task.worktree_path), task.branch)
+        database.mark_abandoned(task.id, notes=note_text)
+
+    out(f"Abandoned {task.ticket_key}.")
+    for entry in log:
+        out(f"  {entry}")
+    out("Run 'lazyfish prep' to pick up the next ticket.")
+
+
+# --------------------------------------------------------------------------- #
+# status
+# --------------------------------------------------------------------------- #
+
+
+@cli.command()
+@click.option(
+    "--all",
+    "all_profiles",
+    is_flag=True,
+    help="Report every profile, ignoring --repo.",
+)
+@click.pass_context
+def status(ctx: click.Context, all_profiles: bool) -> None:
+    """Show acceptance rates and cycle time, grouped by repo profile."""
+    config = _config(ctx, require_credentials=False)
+    selected = None if all_profiles or ctx.obj.get("repo") is None else _profile(ctx, config).name
+
+    with _database(ctx) as database:
+        groups = database.stats(selected)
+        if not groups:
+            out("No tasks recorded yet. Run 'lazyfish prep' to start one.")
+            return
+
+        for stats in groups:
+            out(f"[{stats.repo_profile}]")
+            out(_field("prepared", str(stats.prepared)))
+            out(_field("in flight", str(stats.in_flight)))
+            out(_field("accepted as-is", str(stats.accepted_as_is)))
+            out(_field("accepted modified", str(stats.accepted_modified)))
+            rate = stats.as_is_rate
+            out(
+                _field(
+                    "as-is rate",
+                    f"{rate * 100:.0f}%" if rate is not None else "n/a",
+                )
+            )
+            out(_field("abandoned", str(stats.abandoned)))
+            out(_field("top pick chosen", f"{stats.top_pick_count}/{stats.prepared}"))
+            average = stats.average_minutes_to_accept
+            out(
+                _field(
+                    "avg prep->accept",
+                    f"{average:.1f} minutes" if average is not None else "n/a",
+                )
+            )
+            out("")
+
+        # Worktrees that still exist: either awaiting a plan, or recorded and
+        # presumably being implemented right now.
+        open_tasks = [
+            task for task in database.list_tasks(selected) if task.state != STATE_ABANDONED
+        ]
+        if open_tasks:
+            out("Open worktrees:")
+            for task in open_tasks:
+                label = "awaiting plan" if task.state == STATE_READY_FOR_PLAN else "plan recorded"
+                out(f"  {task.repo_profile}: {task.ticket_key} ({label}) {task.worktree_path}")
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+
+def main() -> int:
+    """Console entry point. Turns LazyfishError into a message, never a traceback."""
+    try:
+        # standalone_mode=False returns the exit code instead of calling
+        # sys.exit, which is what lets ctx.exit(6) reach the caller intact.
+        result = cli.main(standalone_mode=False, obj={})
+        return result if isinstance(result, int) else 0
+    except click.exceptions.Abort:
+        click.echo("Aborted.", err=True)
+        return 130
+    except click.ClickException as exc:
+        exc.show()
+        return exc.exit_code
+    except LazyfishError as exc:
+        click.echo(f"error: {exc}", err=True)
+        return exc.exit_code
+    except KeyboardInterrupt:
+        click.echo("Interrupted.", err=True)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

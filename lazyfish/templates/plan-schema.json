@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lazyfish.dev/schemas/plan-1.json",
+  "title": "lazyfish plan",
+  "description": "The output of the design phase for one ticket. Keys are English and fixed; prose values may be written in whatever language the team designs in.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ticket",
+    "understanding",
+    "changes",
+    "assumptions",
+    "alternatives_considered",
+    "open_questions",
+    "acceptance_criteria",
+    "confidence",
+    "needs_human"
+  ],
+  "properties": {
+    "ticket": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tracker key of the ticket this plan is for, e.g. PROJ-123."
+    },
+    "understanding": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the ticket asks for, restated in the plan author's own words."
+    },
+    "changes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Files the implementation is expected to touch.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "action", "reason"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Path relative to the repository root."
+          },
+          "action": {
+            "type": "string",
+            "enum": ["create", "modify", "delete", "rename"],
+            "description": "What happens to the file."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Why this file has to change."
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "How sure the plan is about this particular change."
+          }
+        }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Statements taken as true without verification. Must not be empty: a plan with no stated assumptions is hiding them, not free of them.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "alternatives_considered": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Approaches that were rejected, and why.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["option", "rejected_because"],
+        "properties": {
+          "option": { "type": "string", "minLength": 1 },
+          "rejected_because": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Anything still undecided. If a question is genuinely settled, record it with blocking=false and the answer in the text rather than dropping it.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "blocking"],
+        "properties": {
+          "text": { "type": "string", "minLength": 1 },
+          "blocking": {
+            "type": "boolean",
+            "description": "True when work cannot responsibly start until this is answered."
+          },
+          "answer": { "type": "string" }
+        }
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Observable outcomes. Each one must be checkable by running something or looking at something, not by judgement.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "risks": {
+      "type": "array",
+      "description": "Optional. Ways this plan could go wrong, with mitigations.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text"],
+        "properties": {
+          "text": { "type": "string", "minLength": 1 },
+          "mitigation": { "type": "string" }
+        }
+      }
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"],
+      "description": "Overall confidence in the plan as a whole."
+    },
+    "needs_human": {
+      "type": "boolean",
+      "description": "True when a person must review before implementation starts. Must be true when confidence is low or any open question remains."
+    }
+  }
+}

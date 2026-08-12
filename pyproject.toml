@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lazyfish"
+version = "0.1.0"
+description = "Turn an issue-tracker ticket into a ready-to-work git worktree with full context, then record what the design phase produced."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "lazyfish contributors" }]
+keywords = ["jira", "worktree", "agent", "workflow", "issue-tracker", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.27",
+    "jinja2>=3.1",
+    "jsonschema>=4.21",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/lazyfish-dev/lazyfish"
+Issues = "https://github.com/lazyfish-dev/lazyfish/issues"
+
+[project.scripts]
+lazyfish = "lazyfish.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lazyfish"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

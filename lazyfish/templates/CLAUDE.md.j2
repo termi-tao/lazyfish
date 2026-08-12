@@ -1,0 +1,94 @@
+<!-- lazyfish:generated - this file is rebuilt by `lazyfish prep`; do not commit it -->
+# {{ ticket.key }} - {{ ticket.title }}
+
+| Field | Value |
+| --- | --- |
+| Ticket | [{{ ticket.key }}]({{ ticket.url }}) |
+| Status | {{ ticket.status or "unknown" }} |
+| Priority | {{ ticket.priority or "unknown" }} |
+| Type | {{ ticket.issue_type or "unknown" }} |
+| Reporter | {{ ticket.reporter or "unknown" }} |
+| Assignee | {{ ticket.assignee or "unassigned" }} |
+| Repo profile | {{ profile.name }} ({{ profile.path }}) |
+{% if ticket.labels %}
+| Labels | {{ ticket.labels | join(", ") }} |
+{% endif %}
+
+## Description
+
+{% if ticket.description.strip() %}
+{{ ticket.description }}
+{% else %}
+_The ticket has no description._
+{% endif %}
+{% if ticket.comments %}
+
+## Comments
+{% for comment in ticket.comments %}
+
+### {{ loop.index }}. {{ comment.author }}{% if comment.created %} - {{ comment.created }}{% endif %}
+
+
+{{ comment.body }}
+{% endfor %}
+{% endif %}
+{% if attachments %}
+
+## Attachments
+{% for attachment in attachments %}
+
+- `{{ attachment.filename }}` ({{ attachment.mime_type }}, {{ attachment.size_bytes }} bytes){% if attachment.local_path %} - downloaded to `{{ attachment.local_path }}`{% else %} - not downloaded, open it in the tracker if you need it{% endif %}
+
+{% if attachment.inline_text %}
+
+```
+{{ attachment.inline_text.rstrip() }}
+```
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if conventions_text %}
+
+## Project conventions
+
+_Reproduced verbatim from `{{ conventions_path }}`. These are this repository's
+rules and they override any general habit._
+
+{{ conventions_text.rstrip() }}
+{% endif %}
+{% if hints.enabled %}
+
+## Code hints (mechanical search, may be irrelevant)
+
+These lines were found by searching the worktree with {{ hints.tool }} for terms
+taken from the ticket text. They are string matches and nothing more: no call
+graph, no type information, no judgement about relevance. Verify anything you
+use, and expect some of it to be noise.
+
+Search terms: {% for term in hints.terms %}`{{ term }}`{% if not loop.last %}, {% endif %}{% endfor %}
+
+{% if hints.lines %}
+
+```
+{% for line in hints.lines %}
+{{ line }}
+{% endfor %}
+```
+{% if hints.truncated %}
+
+_Truncated to the first {{ hints.lines | length }} matching lines._
+{% endif %}
+{% else %}
+
+_No matches. That may mean the terms were wrong, not that the code is absent._
+{% endif %}
+{% endif %}
+
+## What to do next
+
+1. Read `{{ prompt_path }}` for the design brief and the required output schema.
+2. Write your plan to `{{ plan_path }}`.
+3. Run `lazyfish show` to review it, then `lazyfish accept` to record the outcome.
+
+lazyfish itself performs no design work and calls no model. Everything between
+step 1 and step 3 is yours.
