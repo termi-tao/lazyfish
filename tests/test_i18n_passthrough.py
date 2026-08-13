@@ -154,7 +154,10 @@ def test_a_plan_written_in_another_language_is_accepted(
     assert "重置令牌的有效期被设置为一小时，应为一天。" in result.stdout
     assert "Validation: passes" in result.stdout
 
-    result = runner.invoke(cli, ["accept"], input="n\n漏掉了限流逻辑\n")
+    # --modified rather than an interactive "n": since LF-5 AC15 that answer
+    # rejects the plan instead of recording it as accepted-with-changes. The
+    # note itself is what this test is about, and it travels the same way.
+    result = runner.invoke(cli, ["accept", "--modified", "--note", "漏掉了限流逻辑"])
     assert result.exit_code == 0
 
     from lazyfish.db import Database

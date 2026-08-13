@@ -720,11 +720,17 @@ def test_accept_without_a_plan_file_says_where_to_put_it(
 def test_accepting_with_changes_records_the_note(
     prepared: tuple[dict[str, Path], Path, FakeTracker], runner: CliRunner
 ) -> None:
-    """AC10. The note is stored exactly as typed: it is the data."""
+    """AC10. The note is stored exactly as typed: it is the data.
+
+    LF-5 AC15 gave the interactive `n` answer to the human-rejection path, so
+    "I accepted it, after changing it" is now said with --modified. What this
+    criterion is about - plan_accepted false and the note stored verbatim - is
+    unchanged; see test_promotion.py for the rejection path.
+    """
     env, worktree, _ = prepared
     write_plan(worktree)
 
-    result = runner.invoke(cli, ["accept"], input="n\nmissed the rate limiter\n")
+    result = runner.invoke(cli, ["accept", "--modified", "--note", "missed the rate limiter"])
     assert result.exit_code == 0, result.stdout + result.stderr
 
     row = tasks_of(env)[0]
@@ -823,11 +829,19 @@ def test_status_reports_rates_and_cycle_time_per_profile(
     )
     tracker.tickets = [make_ticket(f"PROJ-{index}") for index in (1, 2, 3)]
 
-    for index, answer in ((1, "y\n"), (2, "n\nadded a migration step\n"), (3, "y\n")):
+    # Two taken as written and one accepted after changes. The middle one uses
+    # --modified because an interactive "n" now rejects the plan outright
+    # (LF-5 AC15) rather than recording it as accepted-with-changes.
+    outcomes = (
+        (1, ["accept", "--as-is"]),
+        (2, ["accept", "--modified", "--note", "added a migration step"]),
+        (3, ["accept", "--as-is"]),
+    )
+    for index, arguments in outcomes:
         result = runner.invoke(cli, ["prep", "--ticket", f"PROJ-{index}"])
         assert result.exit_code == 0, result.stdout + result.stderr
         write_plan(worktree_from(result.stdout), ticket=f"PROJ-{index}")
-        assert runner.invoke(cli, ["accept"], input=answer).exit_code == 0
+        assert runner.invoke(cli, arguments).exit_code == 0
 
     result = runner.invoke(cli, ["status"])
     assert result.exit_code == 0
