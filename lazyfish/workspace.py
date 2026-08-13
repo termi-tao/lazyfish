@@ -20,7 +20,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from .config import RepoProfile, TrackerConfig
+from .config import Profile
 from .errors import WorkspaceError
 from .schema import schema_text
 from .trackers.base import Attachment, Ticket, TrackerClient
@@ -83,7 +83,7 @@ def run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedP
     return result
 
 
-def base_branch(profile: RepoProfile) -> str:
+def base_branch(profile: Profile) -> str:
     """The branch new worktrees start from.
 
     Explicit config wins; otherwise the remote's default branch; otherwise
@@ -93,16 +93,16 @@ def base_branch(profile: RepoProfile) -> str:
     if profile.base_branch:
         return profile.base_branch
     result = run_git(
-        profile.path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False
+        profile.repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False
     )
     if result.returncode == 0 and result.stdout.strip():
         return result.stdout.strip()
-    result = run_git(profile.path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    result = run_git(profile.repo, "rev-parse", "--abbrev-ref", "HEAD", check=False)
     branch = result.stdout.strip() if result.returncode == 0 else ""
     if not branch or branch == "HEAD":
         raise WorkspaceError(
-            f"Cannot determine a base branch for repo profile '{profile.name}' "
-            f"({profile.path}). Set base_branch in the profile, for example "
+            f"Cannot determine a base branch for profile '{profile.name}' "
+            f"({profile.repo}). Set base_branch in the profile, for example "
             f'base_branch = "main".'
         )
     return branch
@@ -136,7 +136,7 @@ class Worktree:
         return self.path / CONTEXT_FILENAME
 
 
-def create_worktree(profile: RepoProfile, ticket_key: str) -> Worktree:
+def create_worktree(profile: Profile, ticket_key: str) -> Worktree:
     """Create (or adopt) the worktree and branch for a ticket.
 
     Idempotent: a second call with an existing worktree returns it untouched,
@@ -155,14 +155,14 @@ def create_worktree(profile: RepoProfile, ticket_key: str) -> Worktree:
         return Worktree(path=target, branch=branch, artifacts_dir=artifacts, created=False)
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    if branch_exists(profile.path, branch):
-        run_git(profile.path, "worktree", "add", str(target), branch)
+    if branch_exists(profile.repo, branch):
+        run_git(profile.repo, "worktree", "add", str(target), branch)
     else:
-        run_git(profile.path, "worktree", "add", "-b", branch, str(target), base_branch(profile))
+        run_git(profile.repo, "worktree", "add", "-b", branch, str(target), base_branch(profile))
     return Worktree(path=target, branch=branch, artifacts_dir=artifacts, created=True)
 
 
-def remove_worktree(profile: RepoProfile, worktree_path: Path, branch: str) -> list[str]:
+def remove_worktree(profile: Profile, worktree_path: Path, branch: str) -> list[str]:
     """Tear down a worktree and its branch. Returns a log of what happened.
 
     Tolerant on purpose: abandon must work even when the worktree was deleted by
@@ -172,7 +172,7 @@ def remove_worktree(profile: RepoProfile, worktree_path: Path, branch: str) -> l
     log: list[str] = []
     if worktree_path.exists():
         result = run_git(
-            profile.path, "worktree", "remove", "--force", str(worktree_path), check=False
+            profile.repo, "worktree", "remove", "--force", str(worktree_path), check=False
         )
         if result.returncode == 0:
             log.append(f"removed worktree {worktree_path}")
@@ -182,10 +182,10 @@ def remove_worktree(profile: RepoProfile, worktree_path: Path, branch: str) -> l
     else:
         log.append(f"worktree {worktree_path} was already gone")
 
-    run_git(profile.path, "worktree", "prune", check=False)
+    run_git(profile.repo, "worktree", "prune", check=False)
 
-    if branch_exists(profile.path, branch):
-        result = run_git(profile.path, "branch", "-D", branch, check=False)
+    if branch_exists(profile.repo, branch):
+        result = run_git(profile.repo, "branch", "-D", branch, check=False)
         if result.returncode == 0:
             log.append(f"deleted branch {branch}")
         else:
@@ -233,7 +233,7 @@ class AttachmentPlan:
     skipped: list[tuple[Attachment, str]] = field(default_factory=list)
 
 
-def plan_attachments(ticket: Ticket, tracker: TrackerConfig) -> AttachmentPlan:
+def plan_attachments(ticket: Ticket, profile: Profile) -> AttachmentPlan:
     """Decide which attachments may be written to disk.
 
     Allowlist by mime type and cap by size (R1). Nothing is fetched here so the
@@ -243,14 +243,14 @@ def plan_attachments(ticket: Ticket, tracker: TrackerConfig) -> AttachmentPlan:
     plan = AttachmentPlan()
     for attachment in ticket.attachments:
         mime = attachment.mime_type.split(";")[0].strip().lower()
-        if mime not in tracker.attachment_mime_allowlist:
+        if mime not in profile.attachment_mime_allowlist:
             plan.skipped.append((attachment, f"mime type {mime} is not in the allowlist"))
-        elif attachment.size_bytes > tracker.attachment_max_bytes:
+        elif attachment.size_bytes > profile.attachment_max_bytes:
             plan.skipped.append(
                 (
                     attachment,
                     f"{attachment.size_bytes} bytes exceeds the "
-                    f"{tracker.attachment_max_bytes} byte limit",
+                    f"{profile.attachment_max_bytes} byte limit",
                 )
             )
         elif not attachment.url:
@@ -400,7 +400,7 @@ def _search_in_python(root: Path, terms: list[str], globs: tuple[str, ...]) -> l
 
 
 def collect_hints(
-    profile: RepoProfile, worktree: Worktree, terms: list[str], enabled: bool = True
+    profile: Profile, worktree: Worktree, terms: list[str], enabled: bool = True
 ) -> Hints:
     """Search the worktree for the extracted terms.
 
@@ -426,7 +426,7 @@ def collect_hints(
 # --------------------------------------------------------------------------- #
 
 
-def read_conventions(profile: RepoProfile) -> tuple[Path | None, str | None]:
+def read_conventions(profile: Profile) -> tuple[Path | None, str | None]:
     """Return the configured conventions path and its content, if any.
 
     Missing is a normal outcome, not an error: the section is omitted and the
@@ -470,7 +470,7 @@ def _committed_content(repo: Path, relative: str) -> str | None:
 def render_context(
     *,
     worktree: Worktree,
-    profile: RepoProfile,
+    profile: Profile,
     ticket: Ticket,
     attachments: list[Attachment],
     hints: Hints,

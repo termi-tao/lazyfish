@@ -26,6 +26,9 @@ dependencies = [
     "httpx>=0.27",
     "jinja2>=3.1",
     "jsonschema>=4.21",
+    # Style-preserving TOML. `lazyfish init` edits a file the user owns, so a
+    # second run must not delete their comments (LF-2 D7).
+    "tomlkit>=0.12",
 ]
 
 [project.optional-dependencies]

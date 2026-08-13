@@ -24,11 +24,11 @@ def database(tmp_path: Path) -> Database:
     return instance
 
 
-def add(database: Database, key: str = "PROJ-1", profile: str = "default", top: bool = True):
+def add(database: Database, key: str = "PROJ-1", profile: str = "work", top: bool = True):
     return database.insert_task(
         ticket_key=key,
         ticket_title=f"title for {key}",
-        repo_profile=profile,
+        profile=profile,
         branch=f"lazyfish/{key}",
         worktree_path=f"/tmp/worktrees/{profile}/{key}",
         artifacts_path=f"/tmp/worktrees/{profile}/{key}/artifacts/{key}",
@@ -50,8 +50,8 @@ def test_insert_and_read_back(database: Database) -> None:
     assert task.state == STATE_READY_FOR_PLAN
     assert task.was_top_pick is True
     assert task.plan_accepted is None
-    assert database.get_in_flight("default").id == task.id
-    assert database.get_by_ticket("PROJ-1", "default").id == task.id
+    assert database.get_in_flight("work").id == task.id
+    assert database.get_by_ticket("PROJ-1", "work").id == task.id
 
 
 def test_one_task_in_flight_per_profile(database: Database) -> None:
@@ -61,10 +61,10 @@ def test_one_task_in_flight_per_profile(database: Database) -> None:
 
 
 def test_profiles_do_not_interfere(database: Database) -> None:
-    first = add(database, "PROJ-1", profile="default")
-    second = add(database, "WEB-9", profile="frontend")
-    assert database.get_in_flight("default").id == first.id
-    assert database.get_in_flight("frontend").id == second.id
+    first = add(database, "PROJ-1", profile="work")
+    second = add(database, "WEB-9", profile="infra")
+    assert database.get_in_flight("work").id == first.id
+    assert database.get_in_flight("infra").id == second.id
 
 
 def test_accept_records_the_outcome(database: Database) -> None:
@@ -79,7 +79,7 @@ def test_accept_records_the_outcome(database: Database) -> None:
 def test_abandon_frees_the_profile(database: Database) -> None:
     task = add(database, "PROJ-1")
     database.mark_abandoned(task.id, notes="deprioritised")
-    assert database.get_in_flight("default") is None
+    assert database.get_in_flight("work") is None
     next_task = add(database, "PROJ-2")
     assert next_task.ticket_key == "PROJ-2"
 
@@ -125,22 +125,22 @@ def test_append_note_keeps_the_existing_text(database: Database) -> None:
 
 
 def test_stats_group_by_profile(database: Database) -> None:
-    first = add(database, "PROJ-1", profile="default")
+    first = add(database, "PROJ-1", profile="work")
     database.mark_accepted(first.id, plan_accepted=True)
-    second = add(database, "PROJ-2", profile="default")
+    second = add(database, "PROJ-2", profile="work")
     database.mark_accepted(second.id, plan_accepted=False, notes="changed")
-    third = add(database, "WEB-1", profile="frontend", top=False)
+    third = add(database, "WEB-1", profile="infra", top=False)
     database.mark_abandoned(third.id)
 
-    grouped = {stats.repo_profile: stats for stats in database.stats()}
-    assert set(grouped) == {"default", "frontend"}
-    assert grouped["default"].accepted_as_is == 1
-    assert grouped["default"].accepted_modified == 1
-    assert grouped["default"].as_is_rate == pytest.approx(0.5)
-    assert grouped["frontend"].abandoned == 1
-    assert grouped["frontend"].top_pick_count == 0
+    grouped = {stats.profile: stats for stats in database.stats()}
+    assert set(grouped) == {"work", "infra"}
+    assert grouped["work"].accepted_as_is == 1
+    assert grouped["work"].accepted_modified == 1
+    assert grouped["work"].as_is_rate == pytest.approx(0.5)
+    assert grouped["infra"].abandoned == 1
+    assert grouped["infra"].top_pick_count == 0
 
-    only_default = database.stats("default")
+    only_default = database.stats("work")
     assert len(only_default) == 1
     assert only_default[0].prepared == 2
 
@@ -156,7 +156,7 @@ def test_average_minutes_to_accept(database: Database) -> None:
     )
     database.conn.commit()
 
-    stats = database.stats("default")[0]
+    stats = database.stats("work")[0]
     assert stats.average_minutes_to_accept == pytest.approx(30.0, abs=0.5)
 
 

@@ -9,7 +9,7 @@
 | Type | {{ ticket.issue_type or "unknown" }} |
 | Reporter | {{ ticket.reporter or "unknown" }} |
 | Assignee | {{ ticket.assignee or "unassigned" }} |
-| Repo profile | {{ profile.name }} ({{ profile.path }}) |
+| Profile | {{ profile.name }} ({{ profile.repo }}) |
 {% if ticket.labels %}
 | Labels | {{ ticket.labels | join(", ") }} |
 {% endif %}

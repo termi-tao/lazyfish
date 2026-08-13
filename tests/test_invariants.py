@@ -235,3 +235,59 @@ def test_test_fixtures_are_exempt_from_the_latin_rule() -> None:
     fixture_dir = REPO_ROOT / "tests"
     scanned = {path.resolve() for path in source_files(PACKAGE_DIR)}
     assert not any(path.resolve() in scanned for path in fixture_dir.rglob("*") if path.is_file())
+
+
+# --------------------------------------------------------------------------- #
+# The rename is complete (LF-2 AC10)
+# --------------------------------------------------------------------------- #
+
+
+RETIRED_PATTERNS = {
+    "repo_profile": re.compile(r"repo_profile"),
+    "--repo": re.compile(r"--repo\b"),
+    "email_env / token_env": re.compile(r"email_env|token_env"),
+}
+
+
+def repository_text_files() -> list[Path]:
+    """Every file a reader of this repository would see, minus build noise."""
+    skip_dirs = {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        "dist",
+        "build",
+        # Working design notes, not distributed and not committed. They quote
+        # the pre-rename configuration model on purpose, as a record of what
+        # was retired, so scanning them would make this guard fail forever.
+        ".design",
+    }
+    suffixes = {".py", ".j2", ".md", ".json", ".toml", ".yml", ".yaml", ".cfg", ".txt"}
+    return sorted(
+        path
+        for path in REPO_ROOT.rglob("*")
+        if path.is_file()
+        and path.suffix in suffixes
+        and not any(part in skip_dirs for part in path.relative_to(REPO_ROOT).parts)
+    )
+
+
+@pytest.mark.parametrize("label", sorted(RETIRED_PATTERNS))
+def test_no_trace_of_the_old_configuration_model(label: str) -> None:
+    """AC10: an incomplete rename hides until an unusual code path runs (R3).
+
+    The old names are gone from the whole repository, not merely from the code
+    paths the other tests happen to exercise. This file names them, so it
+    excludes itself.
+    """
+    pattern = RETIRED_PATTERNS[label]
+    hits = []
+    for path in repository_text_files():
+        if path.name == "test_invariants.py":
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if pattern.search(line):
+                hits.append(f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}")
+    assert hits == [], f"'{label}' still present:\n" + "\n".join(hits)

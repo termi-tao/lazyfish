@@ -13,29 +13,28 @@ from typing import Any
 import httpx
 import pytest
 
-from lazyfish.config import TrackerConfig
 from lazyfish.errors import TrackerError
 from lazyfish.trackers.jira_cloud import JiraCloudClient, render_adf
 
 BASE_URL = "https://example.atlassian.net"
 
 
-def make_config(**overrides: Any) -> TrackerConfig:
+def make_client(handler, **overrides: Any) -> JiraCloudClient:
+    """A client wired to a stub transport.
+
+    Built from plain values: the tracker implementation never sees a profile or
+    a configuration file, and this call proves it.
+    """
     values: dict[str, Any] = {
-        "kind": "jira-cloud",
         "base_url": BASE_URL,
-        "email_env": "LAZYFISH_EMAIL",
-        "token_env": "LAZYFISH_TOKEN",
+        "email": "you@example.com",
+        "api_token": "token",
         "query": 'assignee = currentUser() AND status = "Ready for Dev"',
     }
     values.update(overrides)
-    return TrackerConfig(**values)
-
-
-def make_client(handler, **overrides: Any) -> JiraCloudClient:
     transport = httpx.MockTransport(handler)
     http = httpx.Client(base_url=BASE_URL, transport=transport)
-    return JiraCloudClient(make_config(**overrides), client=http)
+    return JiraCloudClient(client=http, **values)
 
 
 def adf(*paragraphs: str) -> dict[str, Any]:
@@ -126,15 +125,23 @@ def test_a_rejected_query_points_at_the_config() -> None:
     assert "Field 'sprint' does not exist" in message
 
 
-def test_bad_credentials_name_the_environment_variables() -> None:
+def test_bad_credentials_offer_both_explanations() -> None:
+    """401 is ambiguous between a wrong token and an expired one (R10).
+
+    Both cost the user real time to diagnose, and only one of them is visible
+    in any file, so the message has to name both.
+    """
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"errorMessages": ["Unauthorized"]})
 
     with pytest.raises(TrackerError) as excinfo:
         make_client(handler).list_candidates()
     message = str(excinfo.value)
-    assert "LAZYFISH_EMAIL" in message
-    assert "LAZYFISH_TOKEN" in message
+    assert "credentials file" in message
+    assert "365 days" in message
+    assert "id.atlassian.com" in message
+    assert BASE_URL in message
 
 
 def test_a_non_json_response_is_explained() -> None:

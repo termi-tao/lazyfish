@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 CONFIG_FILENAME = "config.toml"
+CREDENTIALS_FILENAME = "credentials"
 DB_FILENAME = "lazyfish.db"
 
 
@@ -31,6 +32,18 @@ def config_path() -> Path:
     if override:
         return Path(override).expanduser()
     return config_home() / CONFIG_FILENAME
+
+
+def credentials_path() -> Path:
+    """Full path to the credentials file, always beside config.toml.
+
+    Deliberately not searched for: never the current directory, never an
+    ancestor, never the target repository. lazyfish creates git worktrees, and a
+    worktree is a fresh checkout in which an ignored file does not appear, so any
+    scheme that reads configuration out of a repository is broken there by
+    construction.
+    """
+    return config_home() / CREDENTIALS_FILENAME
 
 
 def data_home() -> Path:

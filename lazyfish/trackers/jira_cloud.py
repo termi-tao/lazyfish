@@ -19,7 +19,6 @@ from typing import Any
 
 import httpx
 
-from ..config import TrackerConfig
 from ..errors import TrackerError
 from .base import Attachment, Comment, Ticket
 
@@ -199,19 +198,34 @@ def _named(value: Any) -> str | None:
 
 
 class JiraCloudClient:
-    """TrackerClient implementation for Jira Cloud."""
+    """TrackerClient implementation for Jira Cloud.
 
-    def __init__(self, config: TrackerConfig, client: httpx.Client | None = None):
-        self.config = config
+    Takes plain values, not a configuration object. The client does not know
+    that profiles or configuration files exist, which is what keeps a tracker
+    implementation testable without any of that machinery.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        email: str,
+        api_token: str,
+        query: str,
+        timeout_seconds: float = 30.0,
+        client: httpx.Client | None = None,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.query = query
+        self.timeout_seconds = timeout_seconds
         if client is not None:
             self._client = client
             self._owns_client = False
         else:
-            email, token = config.credentials()
             self._client = httpx.Client(
-                base_url=config.base_url,
-                auth=(email, token),
-                timeout=config.timeout_seconds,
+                base_url=self.base_url,
+                auth=(email, api_token),
+                timeout=timeout_seconds,
                 headers={"Accept": "application/json"},
             )
             self._owns_client = True
@@ -227,7 +241,7 @@ class JiraCloudClient:
             response = self._client.request(method, url, **kwargs)
         except httpx.HTTPError as exc:
             raise TrackerError(
-                f"Cannot reach the tracker at {self.config.base_url}: {exc}\n"
+                f"Cannot reach the tracker at {self.base_url}: {exc}\n"
                 f"Check [tracker] base_url and your network connection."
             ) from exc
         return response
@@ -253,9 +267,13 @@ class JiraCloudClient:
         if response.status_code == 401:
             raise TrackerError(
                 f"{context}: the tracker rejected the credentials (HTTP 401).\n"
-                f"Check ${self.config.email_env} is the account email and "
-                f"${self.config.token_env} is a current API token for "
-                f"{self.config.base_url}.{detail}"
+                f"Two things produce this, and they look identical from here:\n"
+                f"  - the email or api_token for this profile is wrong; check the "
+                f"credentials file\n"
+                f"  - the token expired. Atlassian API tokens last at most 365 days, "
+                f"and the day one expires this is the only symptom.\n"
+                f"Issue a new token at id.atlassian.com -> Security -> API tokens, "
+                f"for {self.base_url}.{detail}"
             )
         if response.status_code == 403:
             raise TrackerError(
@@ -287,7 +305,7 @@ class JiraCloudClient:
     def list_candidates(self, limit: int = 5) -> list[Ticket]:
         """Run the configured JQL and return up to `limit` tickets, best first."""
         body = {
-            "jql": self.config.query,
+            "jql": self.query,
             "maxResults": limit,
             "fields": SEARCH_FIELDS,
         }
@@ -299,7 +317,7 @@ class JiraCloudClient:
                 "GET",
                 "/rest/api/3/search",
                 params={
-                    "jql": self.config.query,
+                    "jql": self.query,
                     "maxResults": limit,
                     "fields": ",".join(SEARCH_FIELDS),
                 },
@@ -331,8 +349,7 @@ class JiraCloudClient:
         )
         if response.status_code == 404:
             raise TrackerError(
-                f"Ticket {key} not found, or the account cannot see it.\n"
-                f"Checked {self.config.base_url}."
+                f"Ticket {key} not found, or the account cannot see it.\nChecked {self.base_url}."
             )
         payload = self._json(response, f"Fetching ticket {key}")
         comments = self._fetch_comments(key)
@@ -391,7 +408,7 @@ class JiraCloudClient:
             key=str(key),
             title=title,
             description=render_adf(fields.get("description")),
-            url=f"{self.config.base_url}/browse/{key}",
+            url=f"{self.base_url}/browse/{key}",
             status=_named(fields.get("status")),
             priority=_named(fields.get("priority")),
             issue_type=_named(fields.get("issuetype")),

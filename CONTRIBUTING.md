@@ -57,8 +57,12 @@ ruff format --check .       # formatting
 
 The suite creates real git repositories and real worktrees in temporary
 directories, and stubs the tracker with `httpx.MockTransport`. It never touches
-your config file or your database: everything is redirected through the
-`LAZYFISH_CONFIG` and `LAZYFISH_DATA_DIR` environment variables.
+your own configuration, credentials or database: everything is redirected
+through the `LAZYFISH_CONFIG` and `LAZYFISH_DATA_DIR` environment variables.
+
+Two tests deliberately use `XDG_CONFIG_HOME` instead, because an explicit
+override cannot prove that the tool does not search the current directory - see
+`tests/test_profiles.py`.
 
 ## Adding a tracker
 
@@ -79,7 +83,8 @@ yourself needing a tracker-specific field elsewhere, that field belongs on the
 ## Pull requests
 
 - One change per PR, with a test that fails without it.
-- Do not commit `config.toml`, `*.db`, or anything under an `artifacts/`
-  directory. Ticket text and attachments live there.
+- Do not commit `config.toml`, `credentials`, `*.db`, or anything under an
+  `artifacts/` directory. Ticket text and attachments live in the last one, and
+  an API token lives in the second.
 - Error messages are part of the interface. If you add a failure path, say which
   item is wrong and what was expected; "invalid configuration" is not enough.

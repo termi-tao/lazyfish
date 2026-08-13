@@ -4,7 +4,7 @@ Design notes:
 
 * One file, standard library only. A user who has run `pipx install lazyfish`
   must not also have to run a database server (A-1).
-* WIP=1 per repo profile is enforced by a partial unique index, not only by a
+* WIP=1 per profile is enforced by a partial unique index, not only by a
   check in the CLI. The database, not the caller, is the authority.
 * Illegal state transitions raise instead of silently updating rows: an
   ABANDONED task must never become PLAN_APPROVED.
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket_key     TEXT    NOT NULL,
     ticket_title   TEXT    NOT NULL,
-    repo_profile   TEXT    NOT NULL,
+    profile   TEXT    NOT NULL,
     state          TEXT    NOT NULL,
     branch         TEXT    NOT NULL,
     worktree_path  TEXT    NOT NULL,
@@ -59,14 +59,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     abandoned_at   TEXT
 );
 
--- At most one ticket per repo profile may be awaiting a plan (R4). Only
+-- At most one ticket per profile may be awaiting a plan (R4). Only
 -- READY_FOR_PLAN counts: once a plan is recorded lazyfish's part is over, and
 -- holding the profile hostage while the human implements would leave no way to
 -- start the next ticket short of abandoning a task that was never abandoned.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_in_flight_profile
-    ON tasks (repo_profile) WHERE state = 'READY_FOR_PLAN';
+    ON tasks (profile) WHERE state = 'READY_FOR_PLAN';
 
-CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, repo_profile);
+CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, profile);
 """
 
 
@@ -91,7 +91,7 @@ class Task:
     id: int
     ticket_key: str
     ticket_title: str
-    repo_profile: str
+    profile: str
     state: str
     branch: str
     worktree_path: str
@@ -109,7 +109,7 @@ class Task:
             id=row["id"],
             ticket_key=row["ticket_key"],
             ticket_title=row["ticket_title"],
-            repo_profile=row["repo_profile"],
+            profile=row["profile"],
             state=row["state"],
             branch=row["branch"],
             worktree_path=row["worktree_path"],
@@ -133,9 +133,9 @@ class Task:
 
 @dataclass(frozen=True)
 class ProfileStats:
-    """Aggregates for one repo profile, or for all profiles combined."""
+    """Aggregates for one profile, or for all profiles combined."""
 
-    repo_profile: str
+    profile: str
     prepared: int
     accepted_as_is: int
     accepted_modified: int
@@ -200,16 +200,16 @@ class Database:
         *,
         ticket_key: str,
         ticket_title: str,
-        repo_profile: str,
+        profile: str,
         branch: str,
         worktree_path: str,
         artifacts_path: str,
         was_top_pick: bool,
     ) -> Task:
-        active = self.get_in_flight(repo_profile)
+        active = self.get_in_flight(profile)
         if active is not None:
             raise StateError(
-                f"Repo profile '{repo_profile}' is already waiting for a plan for "
+                f"Profile '{profile}' is already waiting for a plan for "
                 f"{active.ticket_key}. Record it with 'lazyfish accept' or drop it "
                 f"with 'lazyfish abandon' before preparing another ticket."
             )
@@ -217,14 +217,14 @@ class Database:
             cursor = self.conn.execute(
                 """
                 INSERT INTO tasks (
-                    ticket_key, ticket_title, repo_profile, state, branch,
+                    ticket_key, ticket_title, profile, state, branch,
                     worktree_path, artifacts_path, was_top_pick, prepared_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticket_key,
                     ticket_title,
-                    repo_profile,
+                    profile,
                     STATE_READY_FOR_PLAN,
                     branch,
                     worktree_path,
@@ -289,54 +289,53 @@ class Database:
             raise StateError(f"No task with id {task_id}.")
         return task
 
-    def get_in_flight(self, repo_profile: str) -> Task | None:
+    def get_in_flight(self, profile: str) -> Task | None:
         """The task awaiting a plan for a profile. At most one by construction."""
         row = self.conn.execute(
-            "SELECT * FROM tasks WHERE repo_profile = ? AND state = ? ORDER BY id DESC LIMIT 1",
-            (repo_profile, STATE_READY_FOR_PLAN),
+            "SELECT * FROM tasks WHERE profile = ? AND state = ? ORDER BY id DESC LIMIT 1",
+            (profile, STATE_READY_FOR_PLAN),
         ).fetchone()
         return Task.from_row(row) if row else None
 
-    def get_open(self, repo_profile: str) -> Task | None:
+    def get_open(self, profile: str) -> Task | None:
         """The most recent task that has not been abandoned.
 
         Used by `abandon`, which must also be able to clean up the worktree of a
         task whose plan was already recorded.
         """
         row = self.conn.execute(
-            "SELECT * FROM tasks WHERE repo_profile = ? AND state <> ? ORDER BY id DESC LIMIT 1",
-            (repo_profile, STATE_ABANDONED),
+            "SELECT * FROM tasks WHERE profile = ? AND state <> ? ORDER BY id DESC LIMIT 1",
+            (profile, STATE_ABANDONED),
         ).fetchone()
         return Task.from_row(row) if row else None
 
-    def get_by_state(self, state: str, repo_profile: str | None = None) -> list[Task]:
+    def get_by_state(self, state: str, profile: str | None = None) -> list[Task]:
         sql = "SELECT * FROM tasks WHERE state = ?"
         params: list[object] = [state]
-        if repo_profile:
-            sql += " AND repo_profile = ?"
-            params.append(repo_profile)
+        if profile:
+            sql += " AND profile = ?"
+            params.append(profile)
         sql += " ORDER BY id"
         return [Task.from_row(row) for row in self.conn.execute(sql, params)]
 
-    def get_by_ticket(self, ticket_key: str, repo_profile: str) -> Task | None:
+    def get_by_ticket(self, ticket_key: str, profile: str) -> Task | None:
         """Most recent row for a ticket in a profile, whatever its state."""
         row = self.conn.execute(
-            "SELECT * FROM tasks WHERE ticket_key = ? AND repo_profile = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (ticket_key, repo_profile),
+            "SELECT * FROM tasks WHERE ticket_key = ? AND profile = ? ORDER BY id DESC LIMIT 1",
+            (ticket_key, profile),
         ).fetchone()
         return Task.from_row(row) if row else None
 
-    def list_tasks(self, repo_profile: str | None = None) -> list[Task]:
+    def list_tasks(self, profile: str | None = None) -> list[Task]:
         sql = "SELECT * FROM tasks"
         params: list[object] = []
-        if repo_profile:
-            sql += " WHERE repo_profile = ?"
-            params.append(repo_profile)
+        if profile:
+            sql += " WHERE profile = ?"
+            params.append(profile)
         sql += " ORDER BY id"
         return [Task.from_row(row) for row in self.conn.execute(sql, params)]
 
-    def stats(self, repo_profile: str | None = None) -> list[ProfileStats]:
+    def stats(self, profile: str | None = None) -> list[ProfileStats]:
         """Per-profile aggregates, ordered by profile name.
 
         The averages are computed in Python rather than SQL because the
@@ -344,8 +343,8 @@ class Database:
         would corrupt the one number this slice exists to produce.
         """
         by_profile: dict[str, list[Task]] = {}
-        for task in self.list_tasks(repo_profile):
-            by_profile.setdefault(task.repo_profile, []).append(task)
+        for task in self.list_tasks(profile):
+            by_profile.setdefault(task.profile, []).append(task)
 
         result: list[ProfileStats] = []
         for profile in sorted(by_profile):
@@ -357,7 +356,7 @@ class Database:
             ]
             result.append(
                 ProfileStats(
-                    repo_profile=profile,
+                    profile=profile,
                     prepared=len(tasks),
                     accepted_as_is=sum(1 for t in tasks if t.plan_accepted is True),
                     accepted_modified=sum(1 for t in tasks if t.plan_accepted is False),

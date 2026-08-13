@@ -2,8 +2,11 @@
 # contents of your tracker, on a public repository.
 artifacts/
 
-# Local configuration and state.
+# Local configuration and state. `credentials` holds an API token: it is listed
+# here as defence in depth, since the real file lives in ~/.config/lazyfish/ and
+# nothing ever writes it into a repository.
 config.toml
+credentials
 *.db
 *.db-journal
 

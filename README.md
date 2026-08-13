@@ -39,9 +39,9 @@ lazyfish accept   validate it, record whether you took it as written
   A test enforces this, so it cannot drift.
 - **No opinion about your stack.** Test runner, linter, directory layout and
   naming rules come from a file in your repository, not from lazyfish.
-- **No secret storage.** No keyring, no credentials in the config file. It reads
-  environment variables you set, and refuses to start if it finds something that
-  looks like a token in the config file.
+- **No secret storage.** No keyring. Credentials live in one file of yours at
+  mode 600, or in environment variables you set; lazyfish refuses to start if it
+  finds something that looks like a token in the shareable config file.
 
 ## Install
 
@@ -58,85 +58,159 @@ is optional; without it the code search falls back to a slower built-in scan.
 lazyfish init
 ```
 
-It asks six questions - your Atlassian site, your account email, the query that
-selects candidate tickets, a name for this repo profile, the local path to the
-repository, and an optional reminder - then writes
-`~/.config/lazyfish/config.toml`:
+Seven questions - profile name, Atlassian site, account email, API token, the
+query that selects candidate tickets, the local path to the repository, and an
+optional reminder - and you have a working profile. Run it again per project.
+
+lazyfish keeps two files, both in `~/.config/lazyfish/` and nowhere else:
+
+| File | Contains | Shareable |
+| --- | --- | --- |
+| `config.toml` | profiles: tracker, query, repository, options | **Yes.** Commit it to dotfiles, paste it into a bug report, hand it to a colleague. |
+| `credentials` | one section per profile: `email`, `api_token` | **No.** Mode 600, never leaves your machine. |
 
 ```toml
-[tracker]
-kind = "jira-cloud"
-base_url = "https://your-org.atlassian.net"
-query = "assignee = currentUser() AND sprint in openSprints() AND status = \"Ready for Dev\" ORDER BY priority DESC, created ASC"
+default_profile = "work"
 
-[repo.default]
-path = "~/dev/your-repo"
+[defaults]
+timeout_seconds = 30
+branch_prefix = "lazyfish/"
+
+[profile.work]
+tracker  = "jira-cloud"
+base_url = "https://your-org.atlassian.net"
+query    = "assignee = currentUser() AND sprint in openSprints() AND status = \"Ready for Dev\""
+repo     = "~/dev/service-api"
+
+[profile.infra]
+tracker  = "jira-cloud"
+base_url = "https://your-org.atlassian.net"
+query    = "project = INFRA AND assignee = currentUser()"
+repo     = "~/dev/infrastructure"
+search_globs = ["*.tf", "*.yaml"]
 ```
 
-No credentials appear in that file, and lazyfish will refuse to start if any
-turn up in it. Put them in your shell profile instead:
+```toml
+# ~/.config/lazyfish/credentials, mode 600
+[work]
+email     = "you@example.com"
+api_token = "..."
+
+[infra]
+email     = "you@example.com"
+api_token = "..."
+```
+
+The profile name is the join key between the two files. There is no fuzzy
+matching: a profile with no section of the same name in `credentials` is an
+error naming both the profile and the file.
+
+Create API tokens at **id.atlassian.com -> Security -> API tokens**. They last
+at most 365 days; the day one expires, every command starts failing with a 401
+that looks exactly like a misconfiguration, so lazyfish's own message names both
+possibilities.
+
+### Why a query belongs to a profile
+
+Each profile carries its query *and* its repository. That pairing is the whole
+point of the structure: with a single global query, nothing stops you pulling a
+ticket from project A and building its worktree in project B's repository. Here
+that mismatch cannot be expressed.
+
+For the same reason, `tracker`, `base_url`, `query` and `repo` are rejected in
+`[defaults]`. Everything else may be defaulted.
+
+### Selecting a profile
+
+```sh
+lazyfish --profile infra prep     # explicit
+LAZYFISH_PROFILE=infra lazyfish prep
+lazyfish prep                     # falls back to default_profile
+```
+
+`--profile` beats `LAZYFISH_PROFILE`, which beats `default_profile`. Each profile
+keeps its own in-flight ticket and its own statistics: **one ticket per profile
+at a time**, not one overall. Two profiles means two tickets can be awaiting a
+plan simultaneously.
+
+### Defaults and overrides
+
+`[defaults]` sets any non-identity key for every profile; any profile overrides
+any of them. The order is **profile value, then `[defaults]`, then the built-in**.
+
+| Key | Built-in | Meaning |
+| --- | --- | --- |
+| `conventions` | `.lazyfish/conventions.md` | File injected verbatim into the prepared context. Repo-relative or absolute. |
+| `search_globs` | all files | Narrows the mechanical code search. |
+| `account_note` | none | Printed by every `prep`, unchanged. |
+| `base_branch` | the remote's default | Branch new worktrees start from. |
+| `branch_prefix` | `lazyfish/` | Prefix for created branches. |
+| `worktree_root` | `~/.local/share/lazyfish/worktrees` | Where worktrees are created. |
+| `timeout_seconds` | `30` | HTTP timeout. |
+| `attachment_max_bytes` | `100000` | Attachments larger than this are recorded but not downloaded. |
+| `attachment_mime_allowlist` | text-like types | Only these are ever written to disk. |
+
+What decides an override is **whether the key is present**, never whether its
+value looks empty. That matters for two keys, and they point in opposite
+directions:
+
+```toml
+conventions  = ""     # switches the conventions section OFF (not "use the default")
+search_globs = []     # imposes NO filter, i.e. search every file (not "search nothing")
+```
+
+Neither falls back to `[defaults]`. The asymmetry is real and worth reading
+twice; it is recorded rather than silently smoothed over.
+
+### Where lazyfish looks, and where it does not
+
+Only `~/.config/lazyfish/` (honouring `XDG_CONFIG_HOME`). It does **not** search
+the current directory, does not walk up through parent directories, and does not
+read anything from the target repository. A `config.toml` sitting in the
+directory you happen to run from is ignored completely.
+
+That is deliberate rather than lazy: lazyfish creates git worktrees, and a
+worktree is a fresh checkout where ignored files do not appear. Any scheme that
+reads configuration out of a repository behaves differently inside the worktrees
+this tool exists to create.
+
+You can still point it somewhere else explicitly, which is a different thing from
+searching - you name one path and get exactly that path:
+
+```sh
+lazyfish --config /path/to/other.toml status
+LAZYFISH_CONFIG=/path/to/other.toml lazyfish status
+LAZYFISH_DATA_DIR=/path/to/state lazyfish status
+```
+
+### Changing it later
+
+Edit the files. Every command re-reads and re-validates them, so there is
+nothing to reload:
+
+```sh
+$EDITOR ~/.config/lazyfish/config.toml
+lazyfish status                 # cheapest check: parses and validates, no network
+```
+
+`lazyfish init` is also safe to re-run: it appends a new profile and leaves
+everything already in the file - including your own comments and any key you
+added by hand - untouched. A name that already exists is refused rather than
+overwritten; `--force` replaces that one profile and nothing else.
+
+### Credentials from the environment
+
+`LAZYFISH_EMAIL` and `LAZYFISH_TOKEN` override the file, which is what CI and
+containers need:
 
 ```sh
 export LAZYFISH_EMAIL='you@example.com'
-export LAZYFISH_TOKEN='<your API token>'
+export LAZYFISH_TOKEN='...'
 ```
 
-Create the token at **id.atlassian.com -> Security -> API tokens**.
-
-Those two variable names are the defaults, so the config file does not mention
-them. If you need different ones - two Atlassian sites, two sets of credentials -
-name them explicitly:
-
-```toml
-[tracker]
-email_env = "WORK_EMAIL"
-token_env = "WORK_TOKEN"
-```
-
-The query is entirely yours. lazyfish has no built-in project key and no
-built-in status name, because workflow states differ between teams: "To Do",
-"Sprint Ready" and "Ready for Dev" are all real, and hard-coding any of them
-would break everyone else on their first run.
-
-### More than one repository
-
-```toml
-[repo.default]
-path = "~/dev/service-api"
-
-[repo.frontend]
-path = "~/dev/web-client"
-search_globs = ["*.ts", "*.tsx"]
-account_note = "work seat - check which account your AI client is signed in to"
-```
-
-Select one with `lazyfish --repo frontend prep`. Each profile keeps its own
-in-flight ticket and its own statistics.
-
-### Repo profile keys
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `path` | required | The git checkout worktrees are created from. |
-| `conventions` | `.lazyfish/conventions.md` | File injected verbatim into the prepared context. Repo-relative or absolute. Set to `""` to disable. |
-| `search_globs` | all files | Narrows the mechanical code search. |
-| `account_note` | none | Printed by every `prep`, unchanged. |
-| `base_branch` | remote default | Branch new worktrees start from. |
-| `branch_prefix` | `lazyfish/` | Prefix for created branches. |
-| `worktree_root` | `~/.local/share/lazyfish/worktrees` | Where worktrees are created. |
-
-### Tracker keys
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `kind` | required | Only `jira-cloud` today. |
-| `base_url` | required | Your Jira Cloud site. |
-| `query` | required | JQL selecting candidate tickets, best first. |
-| `email_env` | `LAZYFISH_EMAIL` | Name of the variable holding your account email. |
-| `token_env` | `LAZYFISH_TOKEN` | Name of the variable holding your API token. |
-| `attachment_max_bytes` | `100000` | Attachments larger than this are recorded but not downloaded. |
-| `attachment_mime_allowlist` | text-like types | Only these are ever written to disk. |
-| `timeout_seconds` | `30` | HTTP timeout. |
+With **both** set, the credentials file is never opened - it may be absent, or
+wrongly permissioned, without consequence. With only one set, the other still
+comes from the file, so the file is still read and still has to be mode 600.
 
 ## Project conventions
 
@@ -165,7 +239,7 @@ Candidates (5):
    2. PROJ-398  [Medium]  Add pagination to the audit log endpoint
    ...
 Prepared PROJ-412: Password reset email links expire too early
-  repo profile  default
+  profile           work
   branch        lazyfish/PROJ-412
   worktree      ~/.local/share/lazyfish/worktrees/default/PROJ-412
   context       .../PROJ-412/CLAUDE.md
@@ -194,7 +268,7 @@ That answer is the point of the whole exercise. Over a few weeks:
 
 ```sh
 $ lazyfish status
-[default]
+[work]
   prepared          11
   accepted as-is    4
   accepted modified 6
@@ -209,14 +283,15 @@ and the branch and frees the profile for the next one.
 
 | Command | What it does |
 | --- | --- |
-| `lazyfish init` | Write the config file, create the database, optionally check the connection. |
+| `lazyfish init` | Add a profile: write its settings and credentials, create the database. |
+| `lazyfish list` | Show the tickets your query matches. Read-only, no side effects. |
 | `lazyfish prep` | Choose a ticket, create the worktree, write the context files. Idempotent. |
 | `lazyfish show` | Print the current plan and highlight open questions. |
 | `lazyfish accept` | Validate the plan and record whether it was taken as written. |
 | `lazyfish abandon` | Drop the ticket in flight, delete its worktree and branch. |
-| `lazyfish status` | Acceptance rates and cycle time, grouped by repo profile. |
+| `lazyfish status` | Acceptance rates and cycle time, grouped by profile. |
 
-`--repo <profile>` is available on all of them. One ticket per profile is in
+`--profile <name>` is available on all of them. One ticket per profile is in
 flight at a time.
 
 ## What the plan file must contain
@@ -237,8 +312,9 @@ honest.
 
 ## Credentials, data and privacy
 
-- **Credentials** live in environment variables. lazyfish reads them, sends them
-  to your tracker over HTTPS, and stores them nowhere. Pasting a token into
+- **Credentials** live in `~/.config/lazyfish/credentials` at mode 600, or in
+  `LAZYFISH_EMAIL` / `LAZYFISH_TOKEN`. lazyfish reads them, sends them to your
+  tracker over HTTPS, and stores them nowhere else. Pasting a token into
   `config.toml` is a startup error, not a warning.
 - **Ticket data lands on your disk.** Each worktree gets
   `artifacts/<KEY>/ticket.json` with the full ticket, its comments and any
@@ -262,7 +338,7 @@ leaves account selection entirely outside the tool.
 
 The tool cannot protect you from your own client's global sign-in state, and it
 does not try to inspect it, which would be both fragile and tie this tool to one
-vendor. What it offers instead is `account_note`: a string on each repo profile,
+vendor. What it offers instead is `account_note`: a string on each profile,
 printed unchanged by every `prep`, to remind you which context you are in.
 
 ## Adding another tracker

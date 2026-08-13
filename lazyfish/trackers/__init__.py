@@ -7,17 +7,27 @@ and one line in `build_client`, never touching workspace or cli.
 
 from __future__ import annotations
 
-from ..config import TrackerConfig
+from ..config import Credentials, Profile
 from ..errors import ConfigError
 from .base import Attachment, Comment, Ticket, TrackerClient
 
 __all__ = ["Attachment", "Comment", "Ticket", "TrackerClient", "build_client"]
 
 
-def build_client(config: TrackerConfig) -> TrackerClient:
-    """Return the client implementation named by [tracker] kind."""
-    if config.kind == "jira-cloud":
+def build_client(profile: Profile, credentials: Credentials) -> TrackerClient:
+    """Return the client implementation named by the profile's `tracker` key.
+
+    This function is the only place that knows both a profile and a tracker
+    implementation. Everything below it receives plain values.
+    """
+    if profile.tracker == "jira-cloud":
         from .jira_cloud import JiraCloudClient
 
-        return JiraCloudClient(config)
-    raise ConfigError(f"No tracker implementation for kind {config.kind!r}.")
+        return JiraCloudClient(
+            base_url=profile.base_url,
+            email=credentials.email,
+            api_token=credentials.api_token,
+            query=profile.query,
+            timeout_seconds=profile.timeout_seconds,
+        )
+    raise ConfigError(f"No tracker implementation for {profile.tracker!r}.")
