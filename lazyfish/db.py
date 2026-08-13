@@ -326,6 +326,26 @@ class Database:
         ).fetchone()
         return Task.from_row(row) if row else None
 
+    def get_states_for(self, ticket_keys: list[str], profile: str) -> dict[str, str]:
+        """Local state of each of `ticket_keys`, for the ones lazyfish knows.
+
+        One query rather than one per ticket: `list` annotates a whole page of
+        candidates, and a round trip each would be a needless multiple of the
+        work. Keys with no row are simply absent from the result.
+        """
+        if not ticket_keys:
+            return {}
+        placeholders = ", ".join("?" for _ in ticket_keys)
+        rows = self.conn.execute(
+            f"SELECT ticket_key, state FROM tasks "
+            f"WHERE profile = ? AND ticket_key IN ({placeholders}) "
+            f"ORDER BY id",
+            (profile, *ticket_keys),
+        )
+        # Ordered by id, so a later row for the same ticket wins: the current
+        # state, not the first one it ever had.
+        return {row["ticket_key"]: row["state"] for row in rows}
+
     def list_tasks(self, profile: str | None = None) -> list[Task]:
         sql = "SELECT * FROM tasks"
         params: list[object] = []

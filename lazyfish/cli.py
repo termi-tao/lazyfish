@@ -47,6 +47,7 @@ from .db import (
 from .errors import LazyfishError
 from .keywords import extract_keywords
 from .paths import config_path, credentials_path, db_path
+from .rendering import Column, render_table
 from .schema import PlanIssue, load_plan, validate_plan
 from .trackers import build_client
 from .trackers.base import Ticket
@@ -540,6 +541,133 @@ def _connectivity_check(ctx: click.Context, profile_name: str) -> None:
     note(f"  status   : {ticket.status}")
     note(f"  priority : {ticket.priority}")
     note(f"  assignee : {ticket.assignee}")
+
+
+# --------------------------------------------------------------------------- #
+# list
+# --------------------------------------------------------------------------- #
+
+MAX_LIST_LIMIT = 100
+"""One page. The tracker client issues a single request, and Jira Cloud caps a
+search page at 100 results, so asking for more would silently return fewer."""
+
+
+def _known_states(ctx: click.Context, profile_name: str, keys: list[str]) -> dict[str, str]:
+    """Local state for each key, read-only.
+
+    A missing database is not created here. `list` promises to leave the disk
+    exactly as it found it (AC1), and that has to include not bringing a
+    database into existence as a side effect of looking at the queue.
+    """
+    path = ctx.obj.get("db_path") or db_path()
+    if not path.exists():
+        return {}
+    database = Database(path)
+    try:
+        return database.get_states_for(keys, profile_name)
+    finally:
+        database.close()
+
+
+@cli.command("list")
+@click.option(
+    "--limit",
+    default=20,
+    show_default=True,
+    help=f"How many tickets to list (1 to {MAX_LIST_LIMIT}).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+@click.pass_context
+def list_tickets(ctx: click.Context, limit: int, as_json: bool) -> None:
+    """List the tickets the current profile's query matches.
+
+    Read-only: no worktree, no branch, no database row, nothing written
+    anywhere. Run it as often as you like, then start on one of the results
+    with 'lazyfish prep --ticket <KEY>'.
+    """
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        raise LazyfishError(
+            f"--limit must be between 1 and {MAX_LIST_LIMIT}; got {limit}.\n"
+            f"The tracker returns one page per request, and {MAX_LIST_LIMIT} is "
+            f"the largest page it will send."
+        )
+
+    config = _config(ctx)
+    profile = _profile(ctx, config)
+    # Deliberately no require_repo() and no in-flight check: this command never
+    # touches the checkout, and having a ticket in flight is exactly when you
+    # most want to see what else is queued (R3, AC9).
+
+    client = build_client(profile, resolve_credentials(profile.name))
+    try:
+        tickets = client.list_candidates(limit=limit)
+    finally:
+        client.close()
+
+    states = _known_states(ctx, profile.name, [ticket.key for ticket in tickets])
+
+    if as_json:
+        out(
+            json.dumps(
+                [
+                    {
+                        "key": ticket.key,
+                        "summary": ticket.title,
+                        "priority": ticket.priority,
+                        "status": ticket.status,
+                        "is_known": ticket.key in states,
+                        "known_state": states.get(ticket.key),
+                    }
+                    for ticket in tickets
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    out(_field("PROFILE", profile.name))
+    if profile.account_note:
+        out(_field("", profile.account_note))
+    out(_field("QUERY", profile.query))
+    out("")
+
+    if not tickets:
+        out("No tickets matched. Widen the query in your profile, or check that")
+        out("the tickets you expect are in the state the query asks for.")
+        return
+
+    rows = [
+        [
+            ("* " if ticket.key in states else "  ") + ticket.key,
+            ticket.priority or "-",
+            ticket.status or "-",
+            ticket.title,
+        ]
+        for ticket in tickets
+    ]
+    for line in render_table(
+        [
+            Column("  KEY"),
+            Column("PRI"),
+            Column("STATUS"),
+            Column("SUMMARY", max_width=60),
+        ],
+        rows,
+    ):
+        out(line)
+
+    out("")
+    if states:
+        seen = ", ".join(
+            f"{key} ({state.replace('_', ' ').lower()})" for key, state in sorted(states.items())
+        )
+        out(f"*  already tracked locally: {seen}")
+    count = len(tickets)
+    out(
+        f"{count} ticket{'s' if count != 1 else ''}. "
+        f"Start on one with 'lazyfish prep --ticket <KEY>'."
+    )
 
 
 # --------------------------------------------------------------------------- #

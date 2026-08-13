@@ -230,6 +230,50 @@ Put the things a competent stranger would not guess into
 `lazyfish init` can drop a starter version into your repo. If the file is
 missing, that section is simply left out and `prep` says so once.
 
+## Browsing the queue
+
+`lazyfish list` shows what the current profile's query matches, and changes
+nothing: no worktree, no branch, no database row, not even a database file if
+you have not run anything yet. Run it as often as you like.
+
+```sh
+$ lazyfish list
+  PROFILE           work
+                    company seat
+  QUERY             project = PROJ AND assignee = currentUser()
+
+    KEY         PRI     STATUS        SUMMARY
+    PROJ-412    High    Sprint Ready  Password reset links expire too early
+  * PROJ-388    High    Sprint Ready  Cognito token refresh fails
+    PROJ-401    Medium  Sprint Ready  CSV export encoding broken
+
+*  already tracked locally: PROJ-388 (ready for plan)
+3 tickets. Start on one with 'lazyfish prep --ticket <KEY>'.
+```
+
+The `*` is the part a browser tab cannot give you: those tickets already have a
+worktree or a recorded plan on this machine.
+
+Pick anything from the list - not just the first row:
+
+```sh
+lazyfish prep --ticket PROJ-401
+```
+
+`--ticket` fetches by key, so it works even for a ticket the query does not
+match. `prep` records whether you took the query's first result
+(`was_top_pick`), which is the data that eventually says whether the query needs
+adjusting.
+
+`--limit` defaults to 20 and accepts up to 100, which is one page from the
+tracker; a larger number is refused rather than quietly trimmed. `--json` emits
+an array of `{key, summary, priority, status, is_known, known_state}` and
+nothing else, for scripting:
+
+```sh
+lazyfish list --json | jq -r '.[] | select(.is_known | not) | .key'
+```
+
 ## A full run
 
 ```sh
