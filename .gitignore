@@ -7,6 +7,11 @@ config.toml
 *.db
 *.db-journal
 
+# Design notes and planning documents. These are working material, not part of
+# the distributed tool, and they discuss context that does not belong in a
+# public repository.
+.design/
+
 # Python
 __pycache__/
 *.py[cod]
