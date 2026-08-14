@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -160,6 +162,80 @@ def create_worktree(profile: Profile, ticket_key: str) -> Worktree:
     else:
         run_git(profile.repo, "worktree", "add", "-b", branch, str(target), base_branch(profile))
     return Worktree(path=target, branch=branch, artifacts_dir=artifacts, created=True)
+
+
+@dataclass(frozen=True)
+class Drift:
+    """How far a workspace moved away from the baseline it was materialised from.
+
+    An observation, never a verdict. Promotion ignores changes in the workspace
+    by design; this only counts them, so that "did the design stage also write
+    the implementation" becomes a number instead of an impression.
+    """
+
+    files: int
+    lines: int
+
+
+# Everything lazyfish itself writes into a workspace. Excluded from the count,
+# because a freshly prepared workspace where no agent has typed a character
+# already contains all of it -- leaving it in would give every ticket the same
+# constant offset and make the measurement useless.
+#
+# This is not a path boundary. It decides nothing about what may be written and
+# refuses nothing; it removes the tool's own output from a measurement of the
+# agent's. Taken from the constants above so that renaming an output file keeps
+# the exclusion correct.
+TOOL_WRITTEN_PATHS = (STATE_DIRNAME, CONTEXT_FILENAME, ARTIFACTS_DIRNAME)
+
+
+def measure_drift(worktree_path: Path, base_commit: str) -> Drift | None:
+    """Count files and lines changed in a workspace relative to `base_commit`.
+
+    Returns None when the measurement could not be taken, which is never a
+    reason to refuse a promotion: this is an observation, and an observation that
+    can veto is a gate wearing a disguise.
+
+    The comparison runs against a temporary index, so the repository's own index
+    is not touched. That is the same rule promotion follows for its baseline --
+    a check must not rest on state the party being checked can write -- and it
+    also happens to be the tidiest way to count modified and newly created files
+    in one pass: stage everything into a throwaway index, then diff it.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        excludes = [f":(exclude){path}" for path in TOOL_WRITTEN_PATHS]
+
+        staged = subprocess.run(
+            ["git", "-C", str(worktree_path), "add", "-A", "--", ".", *excludes],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if staged.returncode != 0:
+            return None
+
+        counted = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--numstat", "--cached", base_commit],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if counted.returncode != 0:
+            return None
+
+    files = 0
+    lines = 0
+    for row in counted.stdout.splitlines():
+        parts = row.split("\t")
+        if len(parts) < 3:
+            continue
+        files += 1
+        # A binary file reports "-" for both counts. It still moved, so it counts
+        # as a file; there is no meaningful line count to add.
+        added, deleted = parts[0], parts[1]
+        lines += (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
+    return Drift(files=files, lines=lines)
 
 
 def remove_worktree(profile: Profile, worktree_path: Path, branch: str) -> list[str]:

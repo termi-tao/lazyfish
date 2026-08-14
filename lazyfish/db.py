@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -126,7 +126,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- a state and not a failure.
     escalation_reason TEXT,
     -- How the approval was reached (AC14).
-    approved_via      TEXT
+    approved_via      TEXT,
+    -- How far the workspace moved away from base_commit by the time the plan was
+    -- promoted (C1). An observation, not a verdict: promotion ignores workspace
+    -- changes, and these columns exist so that "the design stage also wrote the
+    -- implementation" is a measurable rate rather than an impression. NULL means
+    -- not measured, which includes rows written before C1.
+    workspace_delta_files INTEGER,
+    workspace_delta_lines INTEGER
 );
 
 -- At most one ticket per profile may be awaiting a plan (R4). Only
@@ -171,16 +178,24 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS ix_artifacts_task ON artifacts (task_id, type);
 """
 
-TASK_COLUMNS_ADDED_BY_LF5: tuple[tuple[str, str], ...] = (
+ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
+    # LF-5
     ("base_commit", "base_commit TEXT"),
     ("attempt", "attempt INTEGER NOT NULL DEFAULT 0"),
     ("ticket_attempts", "ticket_attempts INTEGER NOT NULL DEFAULT 0"),
     ("escalation_reason", "escalation_reason TEXT"),
     ("approved_via", "approved_via TEXT"),
+    # C1
+    ("workspace_delta_files", "workspace_delta_files INTEGER"),
+    ("workspace_delta_lines", "workspace_delta_lines INTEGER"),
 )
-"""Columns to add to a `tasks` table that predates LF-5.
+"""Columns added to `tasks` after its first shape, oldest first.
 
-Name paired with its DDL fragment so the same list drives both the check and the
+One list rather than one per ticket. The migration only asks which columns are
+missing, so it does not care when any of them arrived, and a single list means
+the next ticket appends two lines instead of copying the mechanism.
+
+Name paired with its DDL fragment so the same entry drives both the check and the
 statement. Every entry is either nullable or has a default, which is not a style
 choice: SQLite cannot add a NOT NULL column without a default to a table that
 already has rows. That is also why a migrated row's `base_commit` is NULL rather
@@ -225,6 +240,8 @@ class Task:
     ticket_attempts: int = 0
     escalation_reason: str | None = None
     approved_via: str | None = None
+    workspace_delta_files: int | None = None
+    workspace_delta_lines: int | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -248,6 +265,8 @@ class Task:
             ticket_attempts=row["ticket_attempts"],
             escalation_reason=row["escalation_reason"],
             approved_via=row["approved_via"],
+            workspace_delta_files=row["workspace_delta_files"],
+            workspace_delta_lines=row["workspace_delta_lines"],
         )
 
     def minutes_to_accept(self) -> float | None:
@@ -278,6 +297,10 @@ class ProfileStats:
     rejected: int = 0
     escalated: int = 0
     attempts: int = 0
+    # Mean workspace drift over the tasks that were measured (C1). None when
+    # none of them were, which is what a database from before C1 looks like.
+    average_delta_files: float | None = None
+    average_delta_lines: float | None = None
 
     @property
     def accepted(self) -> int:
@@ -289,6 +312,19 @@ class ProfileStats:
         if self.accepted == 0:
             return None
         return self.accepted_as_is / self.accepted
+
+
+def _mean(values: Iterable[int | None]) -> float | None:
+    """Average the measured values, ignoring the ones that were never measured.
+
+    None rather than zero when nothing was measured: a database with no
+    measurements and one whose measurements are all zero are different facts, and
+    the second is the interesting one.
+    """
+    measured = [value for value in values if value is not None]
+    if not measured:
+        return None
+    return sum(measured) / len(measured)
 
 
 def _artifact_from_row(row: sqlite3.Row) -> Artifact:
@@ -372,7 +408,7 @@ class Database:
           a new table inside one transaction rather than editing in place.
         """
         existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)")}
-        for name, definition in TASK_COLUMNS_ADDED_BY_LF5:
+        for name, definition in ADDED_TASK_COLUMNS:
             if name not in existing:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {definition}")
 
@@ -523,6 +559,21 @@ class Database:
             self.conn.execute(
                 "UPDATE tasks SET state = ?, escalation_reason = ?, notes = ? WHERE id = ?",
                 (target, escalation_reason, merged, task_id),
+            )
+        return self._require(task_id)
+
+    def record_drift(self, task_id: int, files: int | None, lines: int | None) -> Task:
+        """Store how far the workspace had drifted when the plan was promoted (C1).
+
+        Writes nothing else, and reads nothing to decide with. Kept separate from
+        the state transition on purpose: a measurement that shares a code path
+        with a decision is one edit away from becoming a condition on it.
+        """
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET workspace_delta_files = ?, workspace_delta_lines = ? "
+                "WHERE id = ?",
+                (files, lines, task_id),
             )
         return self._require(task_id)
 
@@ -714,6 +765,8 @@ class Database:
                     rejected=sum(self._count_rejections(task.id) for task in tasks),
                     escalated=sum(1 for t in tasks if t.state == STATE_ESCALATED),
                     attempts=sum(t.attempt for t in tasks),
+                    average_delta_files=_mean(t.workspace_delta_files for t in tasks),
+                    average_delta_lines=_mean(t.workspace_delta_lines for t in tasks),
                 )
             )
         return result

@@ -77,11 +77,13 @@ from .workspace import (
     PROMPT_FILENAME,
     STATE_DIRNAME,
     AttachmentPlan,
+    Drift,
     Worktree,
     base_branch,
     collect_hints,
     create_worktree,
     download_attachments,
+    measure_drift,
     plan_attachments,
     read_conventions,
     remove_worktree,
@@ -1100,6 +1102,16 @@ def _decide(
 
     issues = contract.validate(plan, worktree.path)
     task = database.count_attempt(task.id)
+
+    # Measure what the stage did to the workspace, and record it (C1). This is
+    # the last place the workspace has anything to say: promotion ignores it from
+    # here on, so the count is taken now or not at all. It is an observation --
+    # nothing below reads it, and a failed measurement is a warning, never a
+    # refusal, because an observation that can veto is a gate in disguise.
+    drift = measure_drift(worktree.path, baseline)
+    if drift is None:
+        warn("could not measure how far the workspace drifted; recording it as unknown.")
+    database.record_drift(task.id, drift.files if drift else None, drift.lines if drift else None)
     artifact = database.record_artifact(
         Artifact(
             id=identifier,
@@ -1123,6 +1135,8 @@ def _decide(
         previous_findings=_previous_findings(database, store, task.id),
     )
 
+    _report_drift(drift)
+
     if decision.promoted:
         promoter = PROMOTER_HUMAN if issues else PROMOTER_ORCHESTRATOR
         artifact = database.promote_artifact(task.id, identifier, promoted_by=promoter)
@@ -1136,6 +1150,22 @@ def _decide(
     database.set_state(task.id, decision.next_state, escalation_reason=decision.escalation_reason)
     _report_rejection(decision, issues, worktree.plan_path)
     raise _Rejected(decision)
+
+
+def _report_drift(drift: Drift | None) -> None:
+    """Say what the workspace contains beyond the plan, and that it goes nowhere.
+
+    Printed whether or not there is anything to report, because the useful case
+    is the one where the number is large and the person has not noticed. The
+    wording says "will not" rather than "must not": those changes are ignored, not
+    forbidden, and describing them as a violation would be a different design.
+    """
+    if drift is None or drift.files == 0:
+        return
+    note(
+        f"the workspace has {drift.files} changed file(s) and {drift.lines} changed "
+        f"line(s) besides the plan; none of it will be promoted or reach a later stage."
+    )
 
 
 def _report_rejection(
@@ -1457,6 +1487,19 @@ def status(ctx: click.Context, all_profiles: bool) -> None:
             out(_field("rejected", str(stats.rejected)))
             out(_field("escalated", str(stats.escalated)))
             out(_field("attempts", str(stats.attempts)))
+            # How much the design stage wrote that was never going to travel (C1).
+            # A trend, not a threshold: no number here means anything is wrong,
+            # and deliberately no line is drawn, because no data supports one yet.
+            delta_files = stats.average_delta_files
+            delta_lines = stats.average_delta_lines
+            out(
+                _field(
+                    "avg workspace drift",
+                    f"{delta_files:.1f} files, {delta_lines:.0f} lines"
+                    if delta_files is not None and delta_lines is not None
+                    else "n/a",
+                )
+            )
             out(_field("abandoned", str(stats.abandoned)))
             out(_field("top pick chosen", f"{stats.top_pick_count}/{stats.prepared}"))
             average = stats.average_minutes_to_accept

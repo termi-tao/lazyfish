@@ -52,6 +52,14 @@ anything. They simply do not travel. No later step starts from that directory.
 The worktree is not deleted — you can look through it, and `prep` will adopt it
 again — but after promotion its contents carry no authority.
 
+What lazyfish does do is **count** what it found there. Promoting reports how many
+files and lines changed beyond the plan, and records both against the ticket, so
+`lazyfish status` can show you the trend. Files lazyfish wrote itself are not
+counted; neither number can fail a promotion, and no threshold is defined. It is
+there so that "the design stage keeps writing the implementation" is a figure you
+can look up rather than a feeling, and so that a decision about whether to do
+anything about it can wait for evidence.
+
 This is why there is no `--force` on `promote`. Checking the plan against its
 contract is the tool's job and is deterministic; overriding a failed check is a
 person's decision, so that flag lives on `accept`, where a person is present, and
