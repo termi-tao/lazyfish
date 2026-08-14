@@ -380,7 +380,7 @@ def test_next_step_on_a_prepared_task_names_the_stage_and_the_workspace(
 ) -> None:
     step = next_step(a_task(database))
     assert step.stage == STAGE_ARCHITECT
-    assert step.workspace == "/tmp/worktrees/work/PROJ-1"
+    assert step.workspace == "/tmp/worktrees/work/PROJ-1/architect"
     assert step.state == STATE_READY_FOR_PLAN
     assert step.blocked_on is None
 

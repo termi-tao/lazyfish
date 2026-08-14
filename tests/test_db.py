@@ -112,10 +112,13 @@ def test_insert_and_read_back(database: Database) -> None:
     assert database.get_by_ticket("PROJ-1", "work").id == task.id
 
 
-def test_one_task_in_flight_per_profile(database: Database) -> None:
-    add(database, "PROJ-1")
-    with pytest.raises(StateError, match="already waiting for a plan for PROJ-1"):
-        add(database, "PROJ-2")
+def test_one_live_task_per_ticket_not_per_profile(database: Database) -> None:
+    """LF-6 D8/D9: profiles may hold many tickets, never two copies of one."""
+    first = add(database, "PROJ-1")
+    second = add(database, "PROJ-2")
+    assert (first.ticket_key, second.ticket_key) == ("PROJ-1", "PROJ-2")
+    with pytest.raises(StateError):
+        add(database, "PROJ-1")
 
 
 def test_profiles_do_not_interfere(database: Database) -> None:
