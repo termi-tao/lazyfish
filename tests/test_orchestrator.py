@@ -88,8 +88,8 @@ def a_task(database: Database, *, state: str = STATE_READY_FOR_PLAN, **columns: 
         ticket_title="Password reset links expire too early",
         profile="work",
         branch="lazyfish/PROJ-1",
-        worktree_path="/tmp/worktrees/work/PROJ-1/architect",
-        artifacts_path="/tmp/worktrees/work/PROJ-1/architect/artifacts/PROJ-1",
+        worktree_path="/tmp/worktrees/work/PROJ-1",
+        artifacts_path="/tmp/worktrees/work/PROJ-1/artifacts/PROJ-1",
         was_top_pick=True,
         base_commit="0" * 40,
     )
