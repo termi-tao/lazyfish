@@ -258,7 +258,7 @@ def materialize(task: Any, call_site: str) -> Workspace:
     # Imported inside the function: db imports artifacts, which imports this
     # module for its filenames, so a module-level import would close a cycle.
     # Materialisation is the one thing in here that needs to read stored state.
-    from .artifacts import ArtifactStore, carries_patch
+    from .artifacts import PATCH_FIELD, ArtifactStore, carries_patch
     from .config import load_config
     from .db import Database
     from .paths import data_home, db_path
@@ -288,9 +288,19 @@ def materialize(task: Any, call_site: str) -> Workspace:
     for artifact in promoted:
         if not carries_patch(artifact.type):
             continue
-        patch = str(store.load(task.id, artifact.id).get("patch") or "")
+        patch = str(store.load(task.id, artifact.id).get(PATCH_FIELD) or "")
         if not patch.strip():
-            continue
+            # Fail closed. A promoted TestArtifact carrying no patch materialises
+            # a workspace with no tests in it, and skipping it quietly makes that
+            # indistinguishable from a correct build: the artifact is missing
+            # from `applied` and nothing is raised. An artifact whose type says
+            # it carries a patch and whose content does not is broken, and the
+            # contract rule that would have caught it earlier arrives with LF-7.
+            raise WorkspaceError(
+                f"The promoted {artifact.type} {artifact.id[:12]} carries no patch, "
+                f"so the workspace for {call_site} cannot be built from it. "
+                f"Promote a replacement, or abandon the task and start again."
+            )
         _apply_patch(target, patch, artifact.id)
         applied.append(artifact.id)
 

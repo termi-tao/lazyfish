@@ -36,6 +36,7 @@ from .artifacts import (
     ArtifactStore,
     content_id,
 )
+from .authority import CALL_SITE_ARCHITECT
 from .config import (
     DEFAULT_ATTACHMENT_MAX_BYTES,
     DEFAULT_ATTACHMENT_MIME_ALLOWLIST,
@@ -296,6 +297,10 @@ def _store_rejection(
         id=content_id(content),
         type=TYPE_REJECTION,
         produced_by=ROLE_ORCHESTRATOR,
+        # No call site, and that is not an omission: a rejection is the
+        # Orchestrator's record of its own deterministic judgement, so no agent
+        # call site produces one and the authority table has nothing to say
+        # about it. `Rejection` is outside GOVERNED_TYPES for the same reason.
         task_id=task.id,
         base_commit=baseline,
         parents=(rejection.target_artifact,),
@@ -1174,6 +1179,12 @@ def _decide(
             id=identifier,
             type=TYPE_TECHNICAL_PLAN,
             produced_by=contract.produced_by,
+            # The authority table is keyed by call site, so the only path that
+            # promotes anything has to fill it in. Left NULL, every artifact is
+            # judged on its role instead -- which is the same answer only while
+            # a role has one call site, and silently the wrong one from the
+            # moment LF-7 gives the Tester two.
+            call_site=CALL_SITE_ARCHITECT,
             task_id=task.id,
             base_commit=baseline,
             attempt=task.attempt,

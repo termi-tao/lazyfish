@@ -255,21 +255,36 @@ def ensure_authorized(artifact: Artifact) -> None:
     workspace, and the question is only ever which of that becomes the version
     downstream is built from.
 
-    Two things are deliberately *not* checked here. A type outside the table is
-    left alone, because a Rejection is the Orchestrator's own record and no call
-    site produces one. And a row with no `call_site` -- everything written before
-    LF-6 -- is judged on its role instead, which is weaker but is the most that
-    can be said about a row that never recorded the finer fact. Neither gap lets
-    a call site promote something its row does not name.
+    A type outside the table is deliberately left alone, because a Rejection is
+    the Orchestrator's own record of its own judgement and no call site produces
+    one.
+
+    A row with no `call_site` is the pre-LF-6 shape, and it is answered only when
+    the role leaves no room for a question: exactly one call site. That is not a
+    narrowing of the fallback's purpose, it is its purpose stated precisely --
+    every artifact a pre-LF-6 database can hold is an architect's TechnicalPlan,
+    and the architect has one call site, so nothing that fallback exists for is
+    turned away. Asking the looser question instead ("may this *role* produce
+    this type anywhere?") would make a missing call site into a way around the
+    table for exactly the roles the table was reshaped to split: with two call
+    sites, a NULL would let either one's output through as the other's.
     """
     if artifact.type not in authority.GOVERNED_TYPES:
         return
     if artifact.call_site is None:
-        if authority.role_may_produce(artifact.produced_by, artifact.type):
+        sites = authority.call_sites_for(artifact.produced_by)
+        if len(sites) == 1 and authority.may_produce(sites[0], artifact.type):
             return
+        if len(sites) == 1:
+            raise LazyfishError(
+                f"{sites[0]} is not authorized to produce a {artifact.type}, and "
+                f"that is the only call site the {artifact.produced_by} role has."
+            )
         raise LazyfishError(
-            f"The {artifact.produced_by} role is not authorized to produce a "
-            f"{artifact.type}. Authority is per call site; see the authority table."
+            f"This {artifact.type} records no call site, so it cannot be judged: "
+            f"the {artifact.produced_by} role runs at {len(sites)} call sites and "
+            f"they are not authorized to produce the same things. Record the call "
+            f"site that produced it."
         )
     if authority.may_produce(artifact.call_site, artifact.type):
         return
