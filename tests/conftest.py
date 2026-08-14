@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from lazyfish.cli import cli
 from lazyfish.trackers.base import Attachment, Comment, Ticket
 
 # --------------------------------------------------------------------------- #
@@ -32,6 +33,22 @@ def git(repo: Path, *args: str) -> str:
         check=True,
     )
     return result.stdout
+
+
+def head_commit(repo: Path) -> str:
+    """The commit a repository (or worktree) currently has checked out."""
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def commit_everything(repo: Path, message: str = "work in progress") -> str:
+    """Stage and commit whatever is in a working tree; returns the new HEAD.
+
+    Used to move HEAD forward under a task whose baseline was recorded earlier,
+    which is how LF-5 AC4 distinguishes "reads the database" from "reads git".
+    """
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", message)
+    return head_commit(repo)
 
 
 @pytest.fixture
@@ -334,3 +351,246 @@ def tracker(monkeypatch: pytest.MonkeyPatch) -> FakeTracker:
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+# --------------------------------------------------------------------------- #
+# Reading back what a command wrote
+# --------------------------------------------------------------------------- #
+#
+# The imports inside these helpers are deliberate: lazyfish.artifacts does not
+# exist until LF-5 is implemented, and a module-level import of it here would
+# stop the whole suite from being collected rather than failing the tests that
+# actually depend on it.
+
+
+def open_database(env: dict[str, Path]):
+    """The database a command under test wrote to."""
+    from lazyfish.db import Database
+
+    database = Database(env["data"] / "lazyfish.db")
+    database.initialise()
+    return database
+
+
+def tasks_of(env: dict[str, Path]) -> list:
+    database = open_database(env)
+    try:
+        return database.list_tasks()
+    finally:
+        database.close()
+
+
+def task_of(env: dict[str, Path], index: int = 0):
+    return tasks_of(env)[index]
+
+
+def artifacts_of(env: dict[str, Path], task_id: int) -> list:
+    """Artifact metadata rows for one task, oldest first."""
+    database = open_database(env)
+    try:
+        return database.list_artifacts(task_id)
+    finally:
+        database.close()
+
+
+def artifact_store(env: dict[str, Path]):
+    from lazyfish.artifacts import ArtifactStore
+
+    return ArtifactStore(env["data"] / "artifacts")
+
+
+def stored_content(env: dict[str, Path], task_id: int, artifact_id: str) -> dict:
+    """The bytes an artifact was promoted with, parsed back."""
+    return artifact_store(env).load(task_id, artifact_id)
+
+
+def stored_artifact_files(env: dict[str, Path], task_id: int) -> list[Path]:
+    directory = env["data"] / "artifacts" / str(task_id)
+    if not directory.exists():
+        return []
+    return sorted(path for path in directory.iterdir() if path.is_file())
+
+
+# --------------------------------------------------------------------------- #
+# An agent that did far more than it was asked to
+# --------------------------------------------------------------------------- #
+
+IMPLEMENTATION_FILE_COUNT = 20
+
+
+MODIFIED_TRACKED_FILES = ("src/auth/reset_token.py", "README.md")
+
+
+def implement_the_whole_ticket(worktree: Path) -> list[str]:
+    """Write a full implementation into a workspace, as K0 describes.
+
+    This is the situation LF-5 exists for: the design stage also implemented the
+    ticket. None of it may survive promotion, and none of it may make promotion
+    fail either (AC1).
+
+    It rewrites the two tracked files named in MODIFIED_TRACKED_FILES and
+    creates a pile of new ones. Only the new paths are returned, because those
+    are the ones no downstream output may mention - the plan itself legitimately
+    names src/auth/reset_token.py in its `changes`.
+    """
+    (worktree / "src" / "auth" / "reset_token.py").write_text(
+        "RESET_TOKEN_TTL = 86400\n\n\ndef build_reset_link(user_id):\n"
+        "    return f'/reset/{user_id}?v=2'\n",
+        encoding="utf-8",
+    )
+    (worktree / "README.md").write_text(
+        "# target repo\n\nNow with a rewritten reset flow.\n", encoding="utf-8"
+    )
+
+    created: list[str] = []
+    for index in range(IMPLEMENTATION_FILE_COUNT):
+        relative = f"src/auth/generated_module_{index:02d}.py"
+        (worktree / relative).write_text(
+            f"MARKER_{index:02d} = 'written by the design stage'\n", encoding="utf-8"
+        )
+        created.append(relative)
+
+    relative = "tests/test_generated_reset_token.py"
+    # The directory has to be created: the repo fixture makes an empty tests/,
+    # and git does not track empty directories, so a worktree checkout has no
+    # tests/ in it. An agent writing a new test file would create the directory
+    # too, so this is what the situation being reproduced actually looks like.
+    (worktree / relative).parent.mkdir(parents=True, exist_ok=True)
+    (worktree / relative).write_text("def test_generated():\n    assert True\n", encoding="utf-8")
+    created.append(relative)
+
+    return created
+
+
+@pytest.fixture
+def prepared_worktree(
+    runner: CliRunner, configured: dict[str, Path], tracker: FakeTracker
+) -> tuple[dict[str, Path], Path, FakeTracker]:
+    """A worktree prepared for PROJ-1, waiting for a plan.
+
+    Same shape as the `prepared` fixture in test_flow.py, hoisted here so the
+    promotion tests can use it without importing from another test module.
+    """
+    result = runner.invoke(cli, ["prep"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    last = result.stdout.strip().splitlines()[-1]
+    assert last.startswith("cd "), last
+    return configured, Path(last[3:]), tracker
+
+
+# --------------------------------------------------------------------------- #
+# A database written by the previous release
+# --------------------------------------------------------------------------- #
+
+LEGACY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_key     TEXT    NOT NULL,
+    ticket_title   TEXT    NOT NULL,
+    profile   TEXT    NOT NULL,
+    state          TEXT    NOT NULL,
+    branch         TEXT    NOT NULL,
+    worktree_path  TEXT    NOT NULL,
+    artifacts_path TEXT    NOT NULL,
+    was_top_pick   INTEGER NOT NULL,
+    plan_accepted  INTEGER,
+    notes          TEXT,
+    prepared_at    TEXT    NOT NULL,
+    accepted_at    TEXT,
+    abandoned_at   TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_in_flight_profile
+    ON tasks (profile) WHERE state = 'READY_FOR_PLAN';
+
+CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, profile);
+"""
+"""The schema as of 4c1a7aa, frozen.
+
+A copy rather than an import on purpose: this is the shape of the database
+already sitting on the user's disk, so it must not follow db.py forward when
+db.py changes. Migrating it is LF-5 AC7.
+"""
+
+# Mirrors the five rows in the user's own database: four abandoned tool-testing
+# tickets and one still awaiting a plan. They are real data and must survive
+# (R2).
+LEGACY_ROWS = (
+    ("CS-100", "First tool test", "spendwatt", "ABANDONED"),
+    ("CS-233", "Second tool test", "spendwatt", "ABANDONED"),
+    ("CS-291", "Third tool test", "spendwatt", "ABANDONED"),
+    ("CS-344", "Fourth tool test", "spendwatt", "ABANDONED"),
+    ("CS-370", "The ticket still in flight", "spendwatt", "READY_FOR_PLAN"),
+)
+
+
+def write_legacy_database(path: Path) -> Path:
+    """Create a database in the pre-LF-5 shape, carrying the five real rows."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(LEGACY_SCHEMA_SQL)
+        for index, (key, title, profile, state) in enumerate(LEGACY_ROWS):
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    ticket_key, ticket_title, profile, state, branch,
+                    worktree_path, artifacts_path, was_top_pick, plan_accepted,
+                    notes, prepared_at, accepted_at, abandoned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    title,
+                    profile,
+                    state,
+                    f"lazyfish/{key}",
+                    f"/home/user/.local/share/lazyfish/worktrees/{profile}/{key}",
+                    f"/home/user/.local/share/lazyfish/worktrees/{profile}/{key}/artifacts/{key}",
+                    1,
+                    None,
+                    f"note {index}" if index else None,
+                    "2026-08-01T09:00:00+00:00",
+                    None,
+                    "2026-08-01T10:00:00+00:00" if state == "ABANDONED" else None,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def legacy_rows_of(path: Path) -> list[tuple]:
+    """Every legacy column of every row, for a before/after comparison."""
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [
+            tuple(row[column] for column in LEGACY_COLUMNS)
+            for row in connection.execute("SELECT * FROM tasks ORDER BY id")
+        ]
+    finally:
+        connection.close()
+
+
+LEGACY_COLUMNS = (
+    "id",
+    "ticket_key",
+    "ticket_title",
+    "profile",
+    "state",
+    "branch",
+    "worktree_path",
+    "artifacts_path",
+    "was_top_pick",
+    "plan_accepted",
+    "notes",
+    "prepared_at",
+    "accepted_at",
+    "abandoned_at",
+)

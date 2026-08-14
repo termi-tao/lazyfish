@@ -12,6 +12,7 @@ nobody has seen fail is not a guard (R8).
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -58,6 +59,13 @@ _SUBPROCESS_CALL = re.compile(
     re.DOTALL,
 )
 _IMPORT = re.compile(r"^\s*(?:import|from)\s+([A-Za-z_][\w.]*)", re.MULTILINE)
+
+# The only two state constants cli.py has any business naming, both for display:
+# one filters the list, the other picks a human-readable label (cli.py:1070 and
+# :1075). A fixed allowlist rather than a pattern, so that learning any of the
+# states LF-5 adds - PLAN_PROMOTED, REJECTED, ESCALATED - fails here. If the CLI
+# needs to show one of those, the label comes from the orchestrator (D13).
+CLI_DISPLAY_STATES = frozenset({"STATE_ABANDONED", "STATE_READY_FOR_PLAN"})
 
 # Latin Extended-B ends at U+024F. Anything above it is another script, with a
 # few punctuation marks that legitimately appear in prose.
@@ -110,6 +118,40 @@ def find_llm_imports(files: list[Path]) -> list[str]:
             if module in LLM_MODULES or root in LLM_MODULES:
                 line = text[: match.start()].count("\n") + 1
                 violations.append(f"{path}:{line}: imports '{module}'")
+    return violations
+
+
+def find_transition_judgement(text: str, source: str = "cli.py") -> list[str]:
+    """Report signs that state transition judgement has leaked into the CLI.
+
+    LF-5 AC9 and R4: the decision layer is the orchestrator, and cli.py is the
+    place it must not reappear. D13 fixes two mechanical criteria:
+
+    1. cli.py does not call check_transition
+    2. the state constants cli.py imports do not grow past the two it already
+       needs for display
+
+    D13 is explicit that this is a *proxy*, not the property. It catches the
+    likely leak - the CLI learning the new states - and misses judgement written
+    with the two old constants. That residue is a review item, not a test.
+    """
+    violations = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if re.search(r"\bcheck_transition\s*\(", line):
+            violations.append(f"{source}:{number}: calls check_transition")
+
+    # Only what is imported from the state module counts. A name can be used
+    # only if it was imported, so the import list is the whole surface - and
+    # reading it rather than every STATE_-shaped token keeps constants that
+    # merely start with the same word out of it (workspace.STATE_DIRNAME).
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.ImportFrom) or node.module not in ("db", "lazyfish.db"):
+            continue
+        for alias in node.names:
+            if alias.name.startswith("STATE_") and alias.name not in CLI_DISPLAY_STATES:
+                violations.append(
+                    f"{source}:{node.lineno}: imports {alias.name}, which display does not need"
+                )
     return violations
 
 
@@ -224,6 +266,59 @@ def test_non_latin_scanner_allows_accented_latin(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed.py"
     allowed.write_text("# A naïve café example, 20° warmer\nvalue = 1\n", encoding="utf-8")
     assert find_non_latin_characters([allowed]) == []
+
+
+def test_the_new_control_modules_are_inside_the_invariant() -> None:
+    """LF-5 AC16: the Orchestrator is not an agent, and nothing exempts it.
+
+    The scanners walk the package, so a new module is covered the moment it
+    exists. This states it as a criterion because the temptation the handoff
+    warns about - letting the driver summarise a failure with one model call -
+    lands precisely in these three files.
+    """
+    scanned = {path.name for path in python_files(PACKAGE_DIR)}
+    expected = {"orchestrator.py", "artifacts.py", "rejection.py"}
+    assert expected <= scanned, f"not scanned: {sorted(expected - scanned)}"
+    assert expected <= {path.name for path in source_files(PACKAGE_DIR)}
+
+
+def test_the_cli_makes_no_transition_judgement() -> None:
+    """LF-5 AC9, first half, as far as it can be mechanised (D13).
+
+    The second half - the orchestrator's decision functions being callable
+    without click - is asserted from the other side, in test_orchestrator.py.
+    """
+    text = (PACKAGE_DIR / "cli.py").read_text(encoding="utf-8")
+    assert find_transition_judgement(text) == []
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "from .db import check_transition\ncheck_transition(task.state, STATE_ABANDONED)\n",
+        "from .db import STATE_PLAN_PROMOTED\n",
+        "from lazyfish.db import STATE_ABANDONED, STATE_ESCALATED\n",
+        "from .db import STATE_REJECTED as WAITING\n",
+    ],
+)
+def test_transition_judgement_scanner_catches_violations(snippet: str) -> None:
+    """R8: a guard nobody has seen fail is not a guard."""
+    assert find_transition_judgement(snippet) != []
+
+
+def test_transition_judgement_scanner_allows_display_use() -> None:
+    """What cli.py legitimately does today, in the shapes it does it in.
+
+    The two display states, and a same-named constant from another module: the
+    criterion is what comes out of db.py, not what a name looks like.
+    """
+    allowed = (
+        "from .db import STATE_ABANDONED, STATE_READY_FOR_PLAN, Database\n"
+        "from .workspace import STATE_DIRNAME\n"
+        "rows = [task for task in tasks if task.state != STATE_ABANDONED]\n"
+        "label = 'waiting' if task.state == STATE_READY_FOR_PLAN else 'recorded'\n"
+    )
+    assert find_transition_judgement(allowed) == []
 
 
 def test_test_fixtures_are_exempt_from_the_latin_rule() -> None:

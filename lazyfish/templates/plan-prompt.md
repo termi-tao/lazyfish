@@ -1,11 +1,29 @@
 # Design brief for {{ ticket.key }}
 
-You are producing a written plan, not an implementation. Do not modify any file
-in this worktree except the plan file itself.
+You are producing a written plan, not an implementation.
 
 Read `CLAUDE.md` in this directory first: it holds the ticket text, the
 discussion around it, this repository's conventions, and mechanical search hits
 that may or may not be relevant.
+
+## Only the plan file leaves this worktree
+
+You may read anything here, and you may write anything here. Nothing is locked.
+
+But when this stage ends, **one file is taken out of this worktree and kept: the
+plan.** Everything else is left behind and carries no weight afterwards. The next
+stage does not start from this directory; it starts from the recorded baseline
+commit plus the plan.
+
+So writing the implementation here is not forbidden — it is simply wasted. It
+will not be reviewed, it will not be built on, and it will not reach a branch.
+If a change seems necessary to understand the problem, make it, read what you
+needed, and describe the conclusion in the plan; that is the part that survives.
+
+One consequence worth stating plainly: a plan that arrives with working code
+attached is harder to judge honestly than a plan on its own, because the code
+makes the plan look settled. The plan is what is being reviewed. Make it good
+enough to be reviewed alone.
 
 ## Output
 
