@@ -16,17 +16,19 @@ from click.testing import CliRunner, Result
 
 from lazyfish.cli import cli
 from lazyfish.db import Database
-from lazyfish.errors import LazyfishError, StateError
+from lazyfish.errors import LazyfishError, StateError, WorkspaceError
 
 from .conftest import (
     FakeTracker,
     artifact_store,
+    artifacts_of,
     commit_everything,
     git,
     make_ticket,
     open_database,
     task_of,
     tasks_of,
+    write_plan,
 )
 
 CALL_SITES = {
@@ -765,3 +767,97 @@ def test_notes_are_preserved_or_appended_when_a_task_is_abandoned(tmp_path: Path
     )
     database.conn.commit()
     assert database.mark_abandoned(kept_task.id).notes == "human rejection survives"
+
+
+# lf6-review-01 section 1: three tests for the wiring rather than the rule.
+# The coverage map is complete against the acceptance criteria and every
+# authority test above still passes, because each one constructs its own
+# Artifact and fills call_site by hand. The one path a real command takes was
+# never walked. "Does this AC have a test" and "does the live path have a test"
+# are different questions.
+
+
+def test_the_live_promote_path_records_the_call_site(
+    runner: CliRunner,
+    configured: dict[str, Path],
+    tracker: FakeTracker,
+) -> None:
+    """AC3: an authority table nothing fills the key for is not enforced.
+
+    With call_site left NULL by the only code path that promotes, every
+    governed artifact is judged on its role instead. That is harmless while
+    architect is the sole call site of its role and becomes silent the moment a
+    second call site for one role exists, which is LF-7's first change.
+    """
+    result = runner.invoke(cli, ["prep"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    write_plan(worktree_from(result))
+    assert runner.invoke(cli, ["promote"]).exit_code == 0
+
+    task = task_of(configured)
+    plans = [row for row in artifacts_of(configured, task.id) if row.type == "TechnicalPlan"]
+    assert [row.call_site for row in plans] == ["architect"]
+
+
+def test_a_missing_call_site_is_tolerated_only_where_the_role_is_unambiguous() -> None:
+    """AC3: the pre-LF-6 fallback must not double as a way around the table.
+
+    Both assertions are load-bearing. The first is the hole: a role with two
+    call sites answers the role-level question for either call site's output,
+    so a NULL call_site accepts both of the two types that are meant to be
+    split between them. The second is the proof that closing the hole does not
+    reject the legacy rows the fallback exists for -- an architect TechnicalPlan
+    is the only artifact shape any pre-LF-6 database can hold.
+    """
+    from lazyfish import authority
+    from lazyfish.artifacts import Artifact, ensure_authorized
+
+    def unlabelled(artifact_type: str, role: str) -> Artifact:
+        return Artifact(
+            id="0" * 64,
+            type=artifact_type,
+            produced_by=role,
+            task_id=1,
+            base_commit="0" * 40,
+        )
+
+    # Asserted first so that it is on record as passing today: tightening the
+    # fallback must not be what makes it fail.
+    assert len(authority.call_sites_for(authority.ROLE_ARCHITECT)) == 1
+    ensure_authorized(unlabelled(authority.TYPE_TECHNICAL_PLAN, authority.ROLE_ARCHITECT))
+
+    assert len(authority.call_sites_for(authority.ROLE_TESTER)) == 2
+    for artifact_type in (authority.TYPE_TEST_ARTIFACT, authority.TYPE_TEST_REPORT):
+        with pytest.raises(LazyfishError, match="call site|authoriz"):
+            ensure_authorized(unlabelled(artifact_type, authority.ROLE_TESTER))
+
+
+def test_materialize_refuses_a_patch_carrying_artifact_with_an_empty_patch(
+    runner: CliRunner,
+    configured: dict[str, Path],
+    repo: Path,
+    tracker: FakeTracker,
+) -> None:
+    """AC1/AC4: a promoted TestArtifact that applies nothing is not a success.
+
+    Skipping it silently produces a workspace with no tests in it that is
+    indistinguishable from a correct materialisation: the artifact is absent
+    from `applied` and nothing is raised. materialize's own docstring calls a
+    reset that missed a file undetectable, and this is that, one layer up.
+    """
+    configured, task, worktree = prepare_materialisation_case(runner, configured, repo, tracker)
+    record_artifact_for(
+        configured,
+        task,
+        call_site="tester@write",
+        type_name="TestArtifact",
+        content={
+            "base_commit": task.base_commit,
+            "patch": "",
+            "coverage": [{"ac_id": "AC1", "test_ids": ["test_outside"]}],
+            "test_command": "pytest",
+        },
+    )
+
+    with pytest.raises(WorkspaceError):
+        materialize(task, "coder")
