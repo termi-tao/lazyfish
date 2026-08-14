@@ -189,11 +189,6 @@ def consumes_for(call_site: str) -> tuple[str, ...]:
     return _require(call_site).consumes
 
 
-def role_of(call_site: str) -> str:
-    """The role that runs at this call site."""
-    return _require(call_site).role
-
-
 def may_produce(call_site: str, artifact_type: str) -> bool:
     """Whether this call site may produce this artifact type.
 
@@ -205,16 +200,11 @@ def may_produce(call_site: str, artifact_type: str) -> bool:
     return site is not None and artifact_type in site.produces
 
 
-def role_may_produce(role: str, artifact_type: str) -> bool:
-    """Whether any of a role's call sites may produce this type.
-
-    The weaker question, for rows recorded before call sites existed. It is
-    weaker on purpose and only ever used as a fallback: a role with two call
-    sites is exactly what the table was reshaped to stop collapsing.
-    """
-    return any(artifact_type in site.produces for site in CALL_SITES.values() if site.role == role)
-
-
 def call_sites_for(role: str) -> tuple[str, ...]:
-    """Every call site a role runs at, in table order."""
+    """Every call site a role runs at, in table order.
+
+    Asked by `ensure_authorized` when an artifact records no call site: a role
+    with one call site can still be judged, a role with two cannot, and the
+    difference is the whole reason the table is keyed by call site.
+    """
     return tuple(name for name, site in CALL_SITES.items() if site.role == role)

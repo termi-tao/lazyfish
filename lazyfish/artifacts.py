@@ -35,21 +35,29 @@ from .workspace import PLAN_FILENAME, STATE_DIRNAME
 # Vocabulary
 # --------------------------------------------------------------------------- #
 
-TYPE_TECHNICAL_PLAN = "TechnicalPlan"
-"""The Architect's artifact. The only contract registered this slice."""
+TYPE_TECHNICAL_PLAN = authority.TYPE_TECHNICAL_PLAN
+ROLE_ARCHITECT = authority.ROLE_ARCHITECT
+"""Re-exported from the authority table, which is where they are defined.
+
+Spelled here as aliases rather than as a second pair of string literals: the
+authority table decides whether a call site may produce a `TechnicalPlan` by
+comparing this exact string, so two independent definitions would fail closed
+and be tedious to find the day one of them was edited. That is the drift
+`authority.py`'s own docstring warns about, and having written the warning it
+would be poor form to be the first to ignore it. The names stay importable from
+here because that is where callers have always found them."""
 
 TYPE_REJECTION = "Rejection"
 """A rejection is stored like any other artifact so that a retry loop leaves a
-record, but it is not a contract: nobody extracts one from a workspace."""
+record, but it is not a contract: nobody extracts one from a workspace. Defined
+here and not in the authority table on purpose -- no call site produces one, so
+the table has nothing to say about it."""
 
-ROLE_ARCHITECT = "architect"
 ROLE_ORCHESTRATOR = "orchestrator"
-"""Producer names. The other three agent roles arrive with their stages.
-
-The Orchestrator is listed because it produces one artifact type of its own, a
-rejection. That is not the same as being an agent (A-4): it produces a record of
-its own deterministic judgement, and it is the only party that may promote
-anything at all."""
+"""The Orchestrator produces one artifact type of its own, a rejection. That is
+not the same as being an agent (A-4): it produces a record of its own
+deterministic judgement, and it is the only party that may promote anything at
+all. The four agent roles live in the authority table."""
 
 PROMOTER_ORCHESTRATOR = "orchestrator"
 PROMOTER_HUMAN = "human"
