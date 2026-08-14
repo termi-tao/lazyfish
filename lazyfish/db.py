@@ -4,7 +4,7 @@ Design notes:
 
 * One file, standard library only. A user who has run `pipx install lazyfish`
   must not also have to run a database server (A-1).
-* WIP=1 per profile is enforced by a partial unique index, not only by a
+* One live task per ticket is enforced by a partial unique index, not only by a
   check in the CLI. The database, not the caller, is the authority.
 * Illegal state transitions raise instead of silently updating rows: an
   ABANDONED task must never become PLAN_APPROVED.
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .artifacts import TYPE_REJECTION, Artifact
+from .artifacts import TYPE_REJECTION, Artifact, ensure_authorized
 from .errors import StateError
 from .paths import db_path
 
@@ -40,12 +40,31 @@ renaming anything (Q2, trap 2). The two are different transitions, not aliases:
               Deterministic, and therefore automatable.
     approve   a person judges whether the plan is right. Never automatic (D10).
 
-Renaming `PLAN_APPROVED` would have moved the WIP partial unique index, which is
-built on `state = 'READY_FOR_PLAN'` and is a structural guarantee rather than an
-application-level check. Inserting a state leaves the index untouched.
+Renaming `PLAN_APPROVED` would have moved the partial unique index below, which
+is a structural guarantee rather than an application-level check. Inserting a
+state leaves the index untouched; LF-6 changed its key, and did so as a stated
+decision with a migration rather than as a side effect of a rename.
 """
 
 ACTIVE_STATES = (STATE_READY_FOR_PLAN, STATE_PLAN_APPROVED)
+
+LIVE_STATES = (
+    STATE_READY_FOR_PLAN,
+    STATE_PLAN_PROMOTED,
+    STATE_REJECTED,
+    STATE_ESCALATED,
+)
+"""The states in which a ticket is still lazyfish's business (LF-6 D9/D10).
+
+The window from prep to a person's decision. `PLAN_APPROVED` is outside it --
+once the plan is recorded lazyfish's part is over and the same ticket may be
+prepared again -- and so is `ABANDONED`.
+
+This list is what "in flight" now means, and it is read by three things that
+must not disagree: the unique index below, the ambiguity check that decides
+whether a command needs `--ticket`, and `get_live`. One definition, because
+a second copy of it would drift the moment a state is inserted.
+"""
 
 APPROVAL_INTERACTIVE = "interactive"
 APPROVAL_NON_INTERACTIVE = "non-interactive"
@@ -136,17 +155,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_delta_lines INTEGER
 );
 
--- At most one ticket per profile may be awaiting a plan (R4). Only
--- READY_FOR_PLAN counts: once a plan is recorded lazyfish's part is over, and
--- holding the profile hostage while the human implements would leave no way to
--- start the next ticket short of abandoning a task that was never abandoned.
---
--- LF-5 inserts states rather than renaming any, precisely so that this index
--- does not move: it is a structural guarantee, and rewriting it would demote
--- the WIP limit to an application-level check (trap 2).
-CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_in_flight_profile
-    ON tasks (profile) WHERE state = 'READY_FOR_PLAN';
-
 CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, profile);
 
 -- Artifact metadata and lineage. The content itself lives in the artifact store
@@ -161,6 +169,11 @@ CREATE TABLE IF NOT EXISTS artifacts (
     task_id     INTEGER NOT NULL REFERENCES tasks (id),
     type        TEXT    NOT NULL,
     produced_by TEXT    NOT NULL,
+    -- Which point in the pipeline produced it. `produced_by` names the role and
+    -- cannot answer this: Tester and Reviewer each run at two call sites, and
+    -- the two are authorised to produce different types (LF-6 D3). NULL on rows
+    -- written before this slice.
+    call_site   TEXT,
     base_commit TEXT,
     -- The artifact ids this one was made from, as a JSON array. Lineage is the
     -- only answer to "which version of the input was this made against", which
@@ -176,6 +189,31 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 
 CREATE INDEX IF NOT EXISTS ix_artifacts_task ON artifacts (task_id, type);
+"""
+
+LEGACY_WIP_INDEX = "ux_tasks_in_flight_profile"
+LIVE_TICKET_INDEX = "ux_tasks_live_ticket"
+
+_LIVE_STATE_LITERALS = ", ".join(f"'{state}'" for state in LIVE_STATES)
+
+LIVE_TICKET_INDEX_SQL = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {LIVE_TICKET_INDEX} "
+    f"ON tasks (profile, ticket_key) WHERE state IN ({_LIVE_STATE_LITERALS})"
+)
+"""The structural guarantee, rekeyed (D9).
+
+    was     ON tasks (profile)              WHERE state = 'READY_FOR_PLAN'
+            one ticket per profile at a time
+    now     ON tasks (profile, ticket_key)  WHERE state IN (the live window)
+            one live task per ticket
+
+Nothing was given up. The old invariant was quota discipline wearing the costume
+of an engineering constraint, and quota is now managed directly by the retry
+budgets; working on several tickets at once is normal, and having one ticket
+with two worktrees and two branches of the same name never was.
+
+The new key also covers the whole window rather than one state of it, which is
+what the old one had quietly stopped doing when LF-5 inserted states around it.
 """
 
 ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -200,6 +238,17 @@ statement. Every entry is either nullable or has a default, which is not a style
 choice: SQLite cannot add a NOT NULL column without a default to a table that
 already has rows. That is also why a migrated row's `base_commit` is NULL rather
 than something invented, and why AC11 exists to say what promote does about it.
+"""
+
+ADDED_ARTIFACT_COLUMNS: tuple[tuple[str, str], ...] = (
+    # LF-6
+    ("call_site", "call_site TEXT"),
+)
+"""The same list for `artifacts`, which reached a second shape in LF-6.
+
+A row migrated from LF-5 has no call site, so authority falls back to the
+role-level question for it. That is the weaker check, and it is the strongest
+one available about a row that never recorded which call site made it.
 """
 
 
@@ -338,6 +387,7 @@ def _artifact_from_row(row: sqlite3.Row) -> Artifact:
         id=row["id"],
         type=row["type"],
         produced_by=row["produced_by"],
+        call_site=row["call_site"],
         task_id=row["task_id"],
         base_commit=row["base_commit"],
         parents=tuple(json.loads(row["parents"] or "[]")),
@@ -345,6 +395,22 @@ def _artifact_from_row(row: sqlite3.Row) -> Artifact:
         attempt=row["attempt"],
         promoted_by=row["promoted_by"],
     )
+
+
+def _merge_notes(existing: str | None, addition: str | None) -> str | None:
+    """Notes are appended, never replaced (D7).
+
+    The rule in one place because four writers need it and each one of them
+    overwriting instead would lose a different thing. Nothing to add leaves the
+    column exactly as it was; nothing there yet means the addition is the whole
+    value. A note is a log of what happened to a ticket, and a log that keeps
+    only the last line is not one.
+    """
+    if not addition:
+        return existing
+    if not existing:
+        return addition
+    return f"{existing}\n{addition}"
 
 
 def check_transition(current: str, target: str) -> None:
@@ -377,19 +443,52 @@ class Database:
 
         1. `executescript(SCHEMA_SQL)` -- every statement is `IF NOT EXISTS`, so
            this creates what is missing and leaves what exists alone.
-        2. `_add_missing_task_columns()` -- because step 1 does *not* reach a
+        2. `_add_missing_columns()` -- because step 1 does *not* reach a
            table that exists but lacks columns. `CREATE TABLE IF NOT EXISTS`
            says nothing about the shape of the table it found, so without this
            an older file would open cleanly and then fail on the first query
            naming a new column.
+        3. `_rekey_live_ticket_index()` -- for the same reason one step up: an
+           index that already exists under the old key is not touched by a
+           `CREATE ... IF NOT EXISTS` for a different one.
         """
         with self.conn:
             self.conn.executescript(SCHEMA_SQL)
-            self._add_missing_task_columns()
+            self._add_missing_columns()
+            self._rekey_live_ticket_index()
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
-    def _add_missing_task_columns(self) -> None:
-        """Add any LF-5 column the `tasks` table does not have yet.
+    def _rekey_live_ticket_index(self) -> None:
+        """Replace the WIP index with the per-ticket one (D9). Idempotent.
+
+        This is the project's first migration of a structural object, and the
+        shape it borrows is the column migration's: state what should be true,
+        let the statements be no-ops when it already is. SQLite cannot alter an
+        index, so the only route is DROP then CREATE, and both halves are
+        conditional -- `initialise()` runs on every open, and a second run that
+        threw would turn a migration into a one-shot.
+
+        Correct on all three shapes of file: a new database has neither index and
+        gets the new one; a current database has it already and nothing happens;
+        an older database has the old index, which is dropped, and gains the new
+        one. No row is read or written either way.
+        """
+        self.conn.execute(f"DROP INDEX IF EXISTS {LEGACY_WIP_INDEX}")
+        try:
+            self.conn.execute(LIVE_TICKET_INDEX_SQL)
+        except sqlite3.IntegrityError as exc:
+            # Only reachable from a file that already holds two live rows for one
+            # ticket, which no version of the application could produce. Said
+            # plainly rather than as a raw sqlite message, because the fix is to
+            # abandon one of them and there is no way to guess which.
+            raise StateError(
+                "This database already contains two live tasks for the same ticket, "
+                "which the new per-ticket index forbids. Abandon the one you do not "
+                f"want to keep, then run the command again. ({exc})"
+            ) from exc
+
+    def _add_missing_columns(self) -> None:
+        """Add any column the tables do not have yet.
 
         This is the project's first migration, so the shape is worth stating
         plainly -- the next one should look like this:
@@ -407,10 +506,14 @@ class Database:
           future migration that genuinely needs to rewrite rows should copy into
           a new table inside one transaction rather than editing in place.
         """
-        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)")}
-        for name, definition in ADDED_TASK_COLUMNS:
-            if name not in existing:
-                self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {definition}")
+        for table, columns in (
+            ("tasks", ADDED_TASK_COLUMNS),
+            ("artifacts", ADDED_ARTIFACT_COLUMNS),
+        ):
+            existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in columns:
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
     def close(self) -> None:
         self.conn.close()
@@ -435,12 +538,21 @@ class Database:
         was_top_pick: bool,
         base_commit: str | None = None,
     ) -> Task:
-        active = self.get_in_flight(profile)
-        if active is not None:
+        """Record a newly prepared ticket.
+
+        A profile may hold as many live tickets as the person wants (D8); what it
+        may not hold is two live copies of one ticket, because that means two
+        worktrees and two branches of the same name racing each other. The index
+        is the authority here and this check only exists to say so in a sentence
+        instead of an sqlite constraint message.
+        """
+        live = self.get_live_for_ticket(profile, ticket_key)
+        if live is not None:
             raise StateError(
-                f"Profile '{profile}' is already waiting for a plan for "
-                f"{active.ticket_key}. Record it with 'lazyfish accept' or drop it "
-                f"with 'lazyfish abandon' before preparing another ticket."
+                f"{ticket_key} already has a live task in profile '{profile}' "
+                f"({live.state}), using worktree {live.worktree_path}. Finish it with "
+                f"'lazyfish accept' or drop it with 'lazyfish abandon --ticket "
+                f"{ticket_key}' before preparing it again."
             )
         with self.conn:
             cursor = self.conn.execute(
@@ -484,9 +596,16 @@ class Database:
         does not even parse.
 
         `approved_via` records how the decision was made, not what it was.
+
+        `notes` is appended, never overwritten (D7). A person who turned an
+        earlier plan down wrote their reason into this column, and `status` and
+        `show` are the only places anyone ever sees it; replacing it on the
+        accept that finally succeeds erased the one record of why the first
+        attempt was wrong. Given nothing, the column is left as it is.
         """
         task = self._require(task_id)
         check_transition(task.state, STATE_PLAN_APPROVED)
+        merged = _merge_notes(task.notes, notes)
         with self.conn:
             self.conn.execute(
                 """
@@ -498,7 +617,7 @@ class Database:
                 (
                     STATE_PLAN_APPROVED,
                     int(plan_accepted),
-                    notes,
+                    merged,
                     utc_now(),
                     approved_via,
                     task_id,
@@ -509,7 +628,7 @@ class Database:
     def mark_abandoned(self, task_id: int, *, notes: str | None = None) -> Task:
         task = self._require(task_id)
         check_transition(task.state, STATE_ABANDONED)
-        merged = notes if notes else task.notes
+        merged = _merge_notes(task.notes, notes)
         with self.conn:
             self.conn.execute(
                 "UPDATE tasks SET state = ?, notes = ?, abandoned_at = ? WHERE id = ?",
@@ -554,7 +673,7 @@ class Database:
         # REJECTED in the table would describe a loop the machine does not have.
         if target != task.state:
             check_transition(task.state, target)
-        merged = f"{task.notes}\n{notes}" if task.notes and notes else (notes or task.notes)
+        merged = _merge_notes(task.notes, notes)
         with self.conn:
             self.conn.execute(
                 "UPDATE tasks SET state = ?, escalation_reason = ?, notes = ? WHERE id = ?",
@@ -589,9 +708,9 @@ class Database:
             self.conn.execute(
                 """
                 INSERT INTO artifacts (
-                    id, task_id, type, produced_by, base_commit, parents,
+                    id, task_id, type, produced_by, call_site, base_commit, parents,
                     promoted_at, promoted_by, attempt, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (task_id, id) DO NOTHING
                 """,
                 (
@@ -599,6 +718,7 @@ class Database:
                     artifact.task_id,
                     artifact.type,
                     artifact.produced_by,
+                    artifact.call_site,
                     artifact.base_commit,
                     json.dumps(list(artifact.parents)),
                     artifact.promoted_at,
@@ -616,7 +736,14 @@ class Database:
         authority (D2); a person overriding the contract with `--force` is
         recorded as the promoter instead, so the override reads as what it is
         rather than as a clean pass.
+
+        The authority table is consulted here rather than at the call site, and
+        that placement is the whole boundary (AC2, AC3). Promotion is the single
+        act that makes something the version downstream is built from, so a
+        check anywhere else would be one a caller could route around -- and a
+        Reviewer promoting an implementation is exactly a caller doing that.
         """
+        ensure_authorized(self._require_artifact(task_id, artifact_id))
         with self.conn:
             self.conn.execute(
                 "UPDATE artifacts SET promoted_at = ?, promoted_by = ? "
@@ -636,7 +763,7 @@ class Database:
     def append_note(self, task_id: int, note: str) -> Task:
         """Append a line to notes, used for things like a schema bypass (R3)."""
         task = self._require(task_id)
-        merged = f"{task.notes}\n{note}" if task.notes else note
+        merged = _merge_notes(task.notes, note)
         with self.conn:
             self.conn.execute("UPDATE tasks SET notes = ? WHERE id = ?", (merged, task_id))
         return self._require(task_id)
@@ -670,6 +797,31 @@ class Database:
         row = self.conn.execute(
             "SELECT * FROM tasks WHERE profile = ? AND state = ? ORDER BY id DESC LIMIT 1",
             (profile, STATE_READY_FOR_PLAN),
+        ).fetchone()
+        return Task.from_row(row) if row else None
+
+    def get_live(self, profile: str) -> list[Task]:
+        """Every task of a profile still inside the window, oldest first (D8).
+
+        The list, not a single row, because a profile may now hold several. A
+        command that needs exactly one asks this and refuses to guess when the
+        answer has more than one entry (D10) -- the ambiguity is answered where
+        the user is, not silently here by taking the newest.
+        """
+        placeholders = ", ".join("?" for _ in LIVE_STATES)
+        rows = self.conn.execute(
+            f"SELECT * FROM tasks WHERE profile = ? AND state IN ({placeholders}) ORDER BY id",
+            (profile, *LIVE_STATES),
+        )
+        return [Task.from_row(row) for row in rows]
+
+    def get_live_for_ticket(self, profile: str, ticket_key: str) -> Task | None:
+        """The live task for one ticket, if there is one. At most one by index."""
+        placeholders = ", ".join("?" for _ in LIVE_STATES)
+        row = self.conn.execute(
+            f"SELECT * FROM tasks WHERE profile = ? AND ticket_key = ? "
+            f"AND state IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+            (profile, ticket_key, *LIVE_STATES),
         ).fetchone()
         return Task.from_row(row) if row else None
 

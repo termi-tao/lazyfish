@@ -19,9 +19,11 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from . import authority
 from .config import Profile
 from .errors import WorkspaceError
 from .schema import schema_text
@@ -138,16 +140,57 @@ class Worktree:
         return self.path / CONTEXT_FILENAME
 
 
-def create_worktree(profile: Profile, ticket_key: str) -> Worktree:
+def ticket_root(profile: Profile, ticket_key: str) -> Path:
+    """Everything belonging to one ticket, one directory per call site inside.
+
+    The extra level is what lets a stage's workspace be kept rather than reset
+    (D5): a person can still read what the Architect did after the Coder has
+    started, and `abandon` still has one directory to remove for one ticket.
+    """
+    return profile.worktree_path(ticket_key)
+
+
+def workspace_path(profile: Profile, ticket_key: str, call_site: str) -> Path:
+    """Where one call site's workspace lives: `<profile>/<KEY>/<call site>`."""
+    return ticket_root(profile, ticket_key) / call_site
+
+
+def _refuse_foreign_content(root: Path) -> None:
+    """Refuse to use a ticket directory that holds something lazyfish did not put there.
+
+    The same guard `create_worktree` has always applied to the workspace itself,
+    one level up: the ticket directory became lazyfish's when D5 put a call site
+    inside it, and everything directly in it should therefore be a worktree.
+    Writing into a directory a person is using for something else is the failure
+    this refuses, and it is worth refusing at the outer level too -- otherwise
+    the ticket directory is the one part of the layout nobody checks.
+    """
+    if not root.is_dir():
+        return
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or not (entry / ".git").exists():
+            raise WorkspaceError(
+                f"{root} holds {entry.name}, which is not a git worktree. lazyfish "
+                f"keeps one directory per call site here. Move it aside or point "
+                f"worktree_root somewhere else."
+            )
+
+
+def create_worktree(
+    profile: Profile, ticket_key: str, call_site: str = authority.CALL_SITE_ARCHITECT
+) -> Worktree:
     """Create (or adopt) the worktree and branch for a ticket.
 
     Idempotent: a second call with an existing worktree returns it untouched,
-    which is what makes `lazyfish prep` safe to run repeatedly (AC6).
+    which is what makes `lazyfish prep` safe to run repeatedly (AC6). The path
+    gained a call-site level in LF-6, and the idempotence did not move with it:
+    three bare preps still build one workspace and print the same bytes.
     """
-    target = profile.worktree_path(ticket_key)
+    target = workspace_path(profile, ticket_key, call_site)
     branch = profile.branch_name(ticket_key)
     artifacts = target / ARTIFACTS_DIRNAME / ticket_key
 
+    _refuse_foreign_content(ticket_root(profile, ticket_key))
     if target.exists():
         if not (target / ".git").exists():
             raise WorkspaceError(
@@ -162,6 +205,162 @@ def create_worktree(profile: Profile, ticket_key: str) -> Worktree:
     else:
         run_git(profile.repo, "worktree", "add", "-b", branch, str(target), base_branch(profile))
     return Worktree(path=target, branch=branch, artifacts_dir=artifacts, created=True)
+
+
+# --------------------------------------------------------------------------- #
+# Materialisation (D4, D12)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """A workspace built from a base commit and a set of promoted artifacts.
+
+    Returned as a value with the inputs named, because "what is in this
+    directory" has to be answerable without looking at the directory: the whole
+    boundary rests on the content being a function of `base_commit` and
+    `applied`, and nothing else.
+    """
+
+    path: Path
+    call_site: str
+    base_commit: str
+    applied: tuple[str, ...]
+
+
+def materialize(task: Any, call_site: str) -> Workspace:
+    """Build the workspace one call site works in (D4, AC1, AC4, AC5).
+
+        workspace = base_commit + the promoted artifacts this call site consumes
+
+    This function is where every boundary in the design is actually enforced, so
+    three things about its shape are load-bearing rather than incidental:
+
+    - **It takes no artifact list.** The signature is `(task, call_site)` and
+      nothing else, because a caller that could name the artifacts could name an
+      unpromoted one, and doing so would look entirely legitimate. That single
+      parameter would bypass "the Coder cannot change the tests" and "only
+      promoted content crosses a stage" at the same time (D12). It reads the
+      lineage itself.
+    - **`consumes` comes from the authority table**, never from a second list
+      kept here. Two descriptions of one rule drift, and the drift would be
+      invisible: a workspace with one artifact too many still looks fine.
+    - **It builds from scratch every time.** The previous contents of the target
+      directory are discarded rather than updated, which is what makes the
+      result independent of anything an agent left behind (AC4). "Discard" is
+      the property under test; reusing a directory would quietly turn it into
+      "reset", and a reset that missed a file would be undetectable.
+
+    Nothing here consults HEAD, refs or the index in any workspace: the base
+    commit is read from the database, because everything inside a workspace is
+    writable by the party being checked.
+    """
+    # Imported inside the function: db imports artifacts, which imports this
+    # module for its filenames, so a module-level import would close a cycle.
+    # Materialisation is the one thing in here that needs to read stored state.
+    from .artifacts import ArtifactStore, carries_patch
+    from .config import load_config
+    from .db import Database
+    from .paths import data_home, db_path
+
+    consumes = authority.consumes_for(call_site)
+    profile = load_config().select(task.profile)
+    profile.require_repo()
+
+    if not task.base_commit:
+        raise WorkspaceError(
+            f"{task.ticket_key} has no recorded base commit, so a workspace for "
+            f"{call_site} cannot be built from one. Abandon the task and prepare "
+            f"it again to record a baseline."
+        )
+
+    database = Database(db_path())
+    try:
+        promoted = _promoted_inputs(database.list_artifacts(task.id), consumes)
+    finally:
+        database.close()
+
+    target = workspace_path(profile, task.ticket_key, call_site)
+    _replace_worktree(profile, target, task.base_commit)
+
+    store = ArtifactStore(data_home() / "artifacts")
+    applied: list[str] = []
+    for artifact in promoted:
+        if not carries_patch(artifact.type):
+            continue
+        patch = str(store.load(task.id, artifact.id).get("patch") or "")
+        if not patch.strip():
+            continue
+        _apply_patch(target, patch, artifact.id)
+        applied.append(artifact.id)
+
+    return Workspace(
+        path=target,
+        call_site=call_site,
+        base_commit=task.base_commit,
+        applied=tuple(applied),
+    )
+
+
+def _promoted_inputs(artifacts: list[Any], consumes: tuple[str, ...]) -> list[Any]:
+    """The latest promoted artifact of each consumed type, in lineage order.
+
+    Latest rather than all of them: a retried stage leaves several artifacts of
+    one type behind, and only the one that was promoted last is the version
+    downstream is built from. Unpromoted rows are not candidates at all -- that
+    is the entire difference between having produced something and having it
+    count.
+    """
+    latest: dict[str, Any] = {}
+    for artifact in artifacts:
+        if artifact.promoted_at is None or artifact.type not in consumes:
+            continue
+        latest[artifact.type] = artifact
+    return [latest[type_name] for type_name in consumes if type_name in latest]
+
+
+def _replace_worktree(profile: Profile, target: Path, base_commit: str) -> None:
+    """Put a clean checkout of `base_commit` at `target`, replacing what is there.
+
+    Detached rather than on a branch: a materialised workspace is an input to one
+    stage, and the promoted artifact carries a patch against the base commit, so
+    there is no history for a branch to name. It also means a stage's workspace
+    can never collide with the ticket's branch or with another stage's.
+    """
+    if target.exists():
+        run_git(profile.repo, "worktree", "remove", "--force", str(target), check=False)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        run_git(profile.repo, "worktree", "prune", check=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run_git(profile.repo, "worktree", "add", "--detach", str(target), base_commit)
+
+
+def _apply_patch(target: Path, patch: str, artifact_id: str) -> None:
+    """Apply one artifact's unified diff to a materialised workspace.
+
+    A diff and not a commit, and applied to the working tree rather than merged:
+    taking a commit would mean trusting refs inside the workspace an agent was
+    given, which is the state most obviously under its control (D4, Q5).
+    """
+    text = patch if patch.endswith("\n") else patch + "\n"
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(target), "apply", "--whitespace=nowarn", "-"],
+            input=text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+    except FileNotFoundError as exc:  # pragma: no cover - git is checked earlier
+        raise WorkspaceError("git was not found on PATH.") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise WorkspaceError(
+            f"The promoted artifact {artifact_id[:12]} does not apply to the "
+            f"workspace at {target}:\n{detail}"
+        )
 
 
 @dataclass(frozen=True)
@@ -238,6 +437,27 @@ def measure_drift(worktree_path: Path, base_commit: str) -> Drift | None:
     return Drift(files=files, lines=lines)
 
 
+def _remove_one_worktree(profile: Profile, worktree_path: Path) -> list[str]:
+    """Take down one workspace directory, whatever state it is in."""
+    if not worktree_path.exists():
+        return [f"worktree {worktree_path} was already gone"]
+    result = run_git(profile.repo, "worktree", "remove", "--force", str(worktree_path), check=False)
+    if result.returncode == 0:
+        return [f"removed worktree {worktree_path}"]
+    shutil.rmtree(worktree_path, ignore_errors=True)
+    return [f"deleted directory {worktree_path} (git worktree remove failed)"]
+
+
+def _delete_branch(profile: Profile, branch: str) -> list[str]:
+    """Delete the ticket's branch, reporting rather than failing."""
+    if not branch_exists(profile.repo, branch):
+        return [f"branch {branch} did not exist"]
+    result = run_git(profile.repo, "branch", "-D", branch, check=False)
+    if result.returncode == 0:
+        return [f"deleted branch {branch}"]
+    return [f"could not delete branch {branch}: {(result.stderr or '').strip()}"]
+
+
 def remove_worktree(profile: Profile, worktree_path: Path, branch: str) -> list[str]:
     """Tear down a worktree and its branch. Returns a log of what happened.
 
@@ -245,30 +465,31 @@ def remove_worktree(profile: Profile, worktree_path: Path, branch: str) -> list[
     hand or the branch was already merged and removed. A cleanup command that
     can itself get stuck defeats the point (R4).
     """
+    log = _remove_one_worktree(profile, worktree_path)
+    run_git(profile.repo, "worktree", "prune", check=False)
+    return log + _delete_branch(profile, branch)
+
+
+def remove_ticket_workspaces(profile: Profile, root: Path, branch: str) -> list[str]:
+    """Tear down every call-site workspace of one ticket, then its branch (R3).
+
+    Scoped to one ticket's directory, which is what makes abandoning one ticket
+    leave the others in the profile untouched (AC16). A ticket has as many
+    workspaces as it has reached call sites, and the task row names only the one
+    it was prepared at, so removing that alone would leave orphans behind --
+    directories git still lists as worktrees and nothing else ever mentions.
+    """
     log: list[str] = []
-    if worktree_path.exists():
-        result = run_git(
-            profile.repo, "worktree", "remove", "--force", str(worktree_path), check=False
-        )
-        if result.returncode == 0:
-            log.append(f"removed worktree {worktree_path}")
-        else:
-            shutil.rmtree(worktree_path, ignore_errors=True)
-            log.append(f"deleted directory {worktree_path} (git worktree remove failed)")
-    else:
-        log.append(f"worktree {worktree_path} was already gone")
+    workspaces = sorted(path for path in root.iterdir() if path.is_dir()) if root.is_dir() else []
+    if not workspaces:
+        log.append(f"worktree {root} was already gone")
+    for path in workspaces:
+        log.extend(_remove_one_worktree(profile, path))
 
     run_git(profile.repo, "worktree", "prune", check=False)
-
-    if branch_exists(profile.repo, branch):
-        result = run_git(profile.repo, "branch", "-D", branch, check=False)
-        if result.returncode == 0:
-            log.append(f"deleted branch {branch}")
-        else:
-            log.append(f"could not delete branch {branch}: {(result.stderr or '').strip()}")
-    else:
-        log.append(f"branch {branch} did not exist")
-    return log
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    return log + _delete_branch(profile, branch)
 
 
 # --------------------------------------------------------------------------- #

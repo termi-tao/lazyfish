@@ -86,9 +86,10 @@ from .workspace import (
     measure_drift,
     plan_attachments,
     read_conventions,
-    remove_worktree,
+    remove_ticket_workspaces,
     render_context,
     run_git,
+    ticket_root,
     write_ticket_json,
 )
 
@@ -169,7 +170,28 @@ class _Rejected(Exception):
         self.decision = decision
 
 
-def _task_awaiting_decision(database: Database, profile: Profile) -> Task:
+TICKET_OPTION_HELP = "Which ticket to act on, when the profile has more than one live."
+
+
+def _ambiguous(profile: Profile, live: list[Task]) -> LazyfishError:
+    """The refusal every command shares when more than one ticket is live (D10).
+
+    Listing the candidates is the point. A command that guessed would be right
+    most of the time and catastrophic the rest, and `abandon` is the one that
+    makes this concrete: it deletes a worktree and a branch, and a wrong guess
+    there cannot be undone.
+    """
+    candidates = "\n".join(f"  {task.ticket_key}  {task.ticket_title}" for task in live)
+    return LazyfishError(
+        f"Profile '{profile.name}' has {len(live)} tickets in flight, so this "
+        f"command does not know which one you mean:\n{candidates}\n"
+        f"Name one with --ticket <KEY>."
+    )
+
+
+def _task_awaiting_decision(
+    database: Database, profile: Profile, ticket_key: str | None = None
+) -> Task:
     """The task a promotion or an approval applies to.
 
     Not `get_in_flight`, which only ever returns a task awaiting a plan: the
@@ -177,18 +199,35 @@ def _task_awaiting_decision(database: Database, profile: Profile) -> Task:
     a promoted or rejected task is still the one being worked on. Whether a given
     state can actually be promoted from is the Orchestrator's answer, not this
     lookup's.
+
+    Several tickets may now be live at once (D8), so this is also where the
+    ambiguity is resolved -- by refusing to resolve it. One candidate is not
+    ambiguous and behaves exactly as it did before; more than one needs
+    `--ticket`; the same shape `Config.select` already uses for profiles.
     """
-    task = database.get_open(profile.name)
-    if task is None:
+    live = database.get_live(profile.name)
+    if ticket_key:
+        for task in live:
+            if task.ticket_key == ticket_key:
+                return task
+        known = ", ".join(task.ticket_key for task in live) or "(none)"
         raise LazyfishError(
-            f"No ticket awaiting a plan for profile '{profile.name}'. Run 'lazyfish prep' first."
+            f"{ticket_key} has no live task in profile '{profile.name}'. In flight: {known}."
         )
-    if task.accepted_at is not None:
+    if len(live) == 1:
+        return live[0]
+    if live:
+        raise _ambiguous(profile, live)
+
+    recent = database.get_open(profile.name)
+    if recent is not None and recent.accepted_at is not None:
         raise LazyfishError(
-            f"The plan for {task.ticket_key} was already recorded on "
-            f"{task.accepted_at}. Run 'lazyfish prep' to start the next ticket."
+            f"The plan for {recent.ticket_key} was already recorded on "
+            f"{recent.accepted_at}. Run 'lazyfish prep' to start the next ticket."
         )
-    return task
+    raise LazyfishError(
+        f"No ticket awaiting a plan for profile '{profile.name}'. Run 'lazyfish prep' first."
+    )
 
 
 def _baseline_for(profile: Profile, task: Task, worktree: Worktree) -> tuple[str, bool]:
@@ -823,16 +862,23 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
     profile.require_repo()
 
     with _database(ctx) as database:
-        # One ticket per profile, for the whole window between prep and approval.
-        # That window used to be a single state, and the partial unique index
-        # still covers only that one; now it is several, so the remaining states
-        # are held here. `accepted_at` is the test rather than a list of states:
-        # it is set exactly when a person has made the decision, and it keeps
-        # this check out of the business of naming states (D13).
-        active = database.get_open(profile.name)
-        if active is not None and active.accepted_at is None:
-            _handle_active(profile, active)
+        # Two intentions, and the difference between them is the whole point of
+        # D10. A bare `prep` means "the one I am on": it reprints the single live
+        # ticket rather than starting anything, which is what keeps it idempotent
+        # (AC15). `prep --ticket K` means "I know I am opening another one", and
+        # opening a second ticket has to be something a person said, not
+        # something that happened because a query returned a different row today.
+        live = database.get_live(profile.name)
+        if ticket_key:
+            for task in live:
+                if task.ticket_key == ticket_key:
+                    _handle_active(profile, task)
+                    return
+        elif len(live) == 1:
+            _handle_active(profile, live[0])
             return
+        elif live:
+            raise _ambiguous(profile, live)
 
         client = build_client(profile, resolve_credentials(profile.name))
         try:
@@ -941,8 +987,9 @@ def _print_attachment_plan(plan: AttachmentPlan) -> None:
 
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Print the raw plan as JSON.")
+@click.option("--ticket", "ticket_key", default=None, help=TICKET_OPTION_HELP)
 @click.pass_context
-def show(ctx: click.Context, as_json: bool) -> None:
+def show(ctx: click.Context, as_json: bool, ticket_key: str | None) -> None:
     """Print the current plan and highlight what still needs a decision."""
     config = _config(ctx)
     profile = _profile(ctx, config)
@@ -950,7 +997,7 @@ def show(ctx: click.Context, as_json: bool) -> None:
     with _database(ctx) as database:
         # Reading the plan is what the approval gate is for, so this has to work
         # while the plan is waiting for approval, not only before it was promoted.
-        task = _task_awaiting_decision(database, profile)
+        task = _task_awaiting_decision(database, profile, ticket_key)
         worktree = _worktree_of(task)
         plan = load_plan(worktree.plan_path)
 
@@ -1025,8 +1072,9 @@ def _print_list(heading: str, items: list[str]) -> None:
 
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Print the answer as JSON.")
+@click.option("--ticket", "ticket_key", default=None, help=TICKET_OPTION_HELP)
 @click.pass_context
-def next(ctx: click.Context, as_json: bool) -> None:
+def next(ctx: click.Context, as_json: bool, ticket_key: str | None) -> None:
     """Say what the next step is, and where to take it.
 
     The same answer for a person and for a driver. In JSON form it is the whole
@@ -1038,7 +1086,15 @@ def next(ctx: click.Context, as_json: bool) -> None:
     profile = _profile(ctx, config)
 
     with _database(ctx) as database:
-        task = database.get_open(profile.name)
+        # "Nothing in flight" is an answer, not a failure: a runner asks this
+        # first and has to be told there is nothing to do without an error. So
+        # the ambiguity check only applies once there is something to be
+        # ambiguous about.
+        live = database.get_live(profile.name)
+        if ticket_key or len(live) > 1:
+            task = _task_awaiting_decision(database, profile, ticket_key)
+        else:
+            task = live[0] if live else database.get_open(profile.name)
         step = next_step(task)
 
     if as_json:
@@ -1057,6 +1113,7 @@ def next(ctx: click.Context, as_json: bool) -> None:
         out(f"Nothing to do: {state_label(step.state)}.")
         return
     out(f"Next stage: {step.stage}")
+    out(_field("ticket", task.ticket_key if task else "-"))
     out(_field("workspace", step.workspace or "-"))
     out(_field("attempt", str(step.attempt)))
 
@@ -1184,8 +1241,9 @@ def _report_rejection(
 
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Print the outcome as JSON.")
+@click.option("--ticket", "ticket_key", default=None, help=TICKET_OPTION_HELP)
 @click.pass_context
-def promote(ctx: click.Context, as_json: bool) -> None:
+def promote(ctx: click.Context, as_json: bool, ticket_key: str | None) -> None:
     """Validate the plan in the workspace and promote it, or reject it.
 
     There is no flag here that skips validation. Promotion is the Orchestrator's
@@ -1200,7 +1258,7 @@ def promote(ctx: click.Context, as_json: bool) -> None:
     profile = _profile(ctx, config)
 
     with _database(ctx) as database:
-        task = _task_awaiting_decision(database, profile)
+        task = _task_awaiting_decision(database, profile, ticket_key)
         try:
             artifact, state, _ = _decide(ctx, database, profile, task, force=False)
         except _Rejected as rejected:
@@ -1264,6 +1322,7 @@ def promote(ctx: click.Context, as_json: bool) -> None:
     help="Accept despite validation errors. Recorded in the task notes.",
 )
 @click.option("--reject", "reject", is_flag=True, help="Turn the plan down; use --note to say why.")
+@click.option("--ticket", "ticket_key", default=None, help=TICKET_OPTION_HELP)
 @click.pass_context
 def accept(
     ctx: click.Context,
@@ -1272,6 +1331,7 @@ def accept(
     reject: bool,
     note_text: str | None,
     force: bool,
+    ticket_key: str | None,
 ) -> None:
     """Promote the plan, then record your decision about it.
 
@@ -1303,7 +1363,7 @@ def accept(
     profile = _profile(ctx, config)
 
     with _database(ctx) as database:
-        task = _task_awaiting_decision(database, profile)
+        task = _task_awaiting_decision(database, profile, ticket_key)
 
         # Promote first, always. Approval is a judgement about content, and
         # nobody should be asked to read a plan that does not even satisfy its
@@ -1414,26 +1474,41 @@ def _record_rejection_by_hand(
 @cli.command()
 @click.option("--note", "note_text", default=None, help="Why the ticket was dropped.")
 @click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@click.option("--ticket", "ticket_key", default=None, help=TICKET_OPTION_HELP)
 @click.pass_context
-def abandon(ctx: click.Context, note_text: str | None, yes: bool) -> None:
-    """Drop the ticket in flight: remove its worktree and branch."""
+def abandon(ctx: click.Context, note_text: str | None, yes: bool, ticket_key: str | None) -> None:
+    """Drop one ticket: remove every workspace it has, and its branch.
+
+    The command that most needs `--ticket` once several tickets can be live
+    (D10). It deletes a worktree and a branch, so a guess it got wrong is not
+    something the person can undo -- and unlike the others, its failure is
+    silent: the ticket you meant to keep is simply gone.
+
+    Cleanup is per ticket rather than per workspace (R3). A ticket now has one
+    directory per call site, and removing only the one the row happens to name
+    would leave the rest behind as orphans nothing ever mentions again.
+    """
     config = _config(ctx)
     profile = _profile(ctx, config)
 
     with _database(ctx) as database:
-        task = database.get_open(profile.name)
+        live = database.get_live(profile.name)
+        if ticket_key or len(live) > 1:
+            task = _task_awaiting_decision(database, profile, ticket_key)
+        else:
+            task = live[0] if live else database.get_open(profile.name)
         if task is None:
             raise LazyfishError(
                 f"No ticket in flight for profile '{profile.name}'; nothing to abandon."
             )
+        profile.require_repo()
+        root = ticket_root(profile, task.ticket_key)
         if not yes:
             click.confirm(
-                f"Abandon {task.ticket_key} and delete {task.worktree_path} "
-                f"and branch {task.branch}?",
+                f"Abandon {task.ticket_key} and delete {root} and branch {task.branch}?",
                 abort=True,
             )
-        profile.require_repo()
-        log = remove_worktree(profile, Path(task.worktree_path), task.branch)
+        log = remove_ticket_workspaces(profile, root, task.branch)
         database.mark_abandoned(task.id, notes=note_text)
 
     out(f"Abandoned {task.ticket_key}.")
