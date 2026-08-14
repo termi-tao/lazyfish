@@ -420,17 +420,41 @@ def test_migrated_rows_read_back_as_tasks(tmp_path: Path) -> None:
 
 
 def test_the_in_flight_index_survives_the_migration(tmp_path: Path) -> None:
-    """Trap 2: the WIP guarantee is structural, and must stay structural.
+    """Trap 2: the guarantee is structural, and must stay structural.
 
-    The legacy data has one READY_FOR_PLAN row, so a second one for the same
-    profile has to be refused by the database itself after migration.
+    One live task per ticket, not one per profile (LF-6 D8/D9). The legacy data
+    has one READY_FOR_PLAN row, so after migration another ticket in that profile
+    is accepted, and a second live copy of that same ticket is refused by the
+    database itself.
+
+    The refusal is provoked with raw SQL, which is the whole point: going through
+    insert_task would stop at its own pre-check and never reach the index, and
+    "the code remembered to look" is a weaker claim than "the database said no".
+    Distinct from the same rule on a fresh database (AC12) in that it is the row
+    the migration carried over that is being protected.
     """
     path = write_legacy_database(tmp_path / "lazyfish.db")
     database = Database(path)
     database.initialise()
     try:
-        with pytest.raises(StateError):
-            add(database, "CS-999", profile="spendwatt")
+        assert add(database, "CS-999", profile="spendwatt").ticket_key == "CS-999"
+        with pytest.raises(sqlite3.IntegrityError):
+            database.conn.execute(
+                """INSERT INTO tasks (ticket_key, ticket_title, profile, state, branch,
+                   worktree_path, artifacts_path, was_top_pick, prepared_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "CS-370",
+                    "a second live copy",
+                    "spendwatt",
+                    STATE_PLAN_PROMOTED,
+                    "lazyfish/CS-370-again",
+                    "/tmp/again",
+                    "/tmp/again/artifacts",
+                    1,
+                    "2026-08-02T09:00:00+00:00",
+                ),
+            )
     finally:
         database.close()
 
