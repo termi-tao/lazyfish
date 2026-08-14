@@ -63,7 +63,6 @@ from .conftest import (
     write_plan,
 )
 
-
 # The three answers to accept's interactive question (D11). They are spelled the
 # same as the three non-interactive flags on purpose: one vocabulary for the
 # outcome, whether it was typed at a prompt or passed on the command line.

@@ -451,6 +451,11 @@ def implement_the_whole_ticket(worktree: Path) -> list[str]:
         created.append(relative)
 
     relative = "tests/test_generated_reset_token.py"
+    # The directory has to be created: the repo fixture makes an empty tests/,
+    # and git does not track empty directories, so a worktree checkout has no
+    # tests/ in it. An agent writing a new test file would create the directory
+    # too, so this is what the situation being reproduced actually looks like.
+    (worktree / relative).parent.mkdir(parents=True, exist_ok=True)
     (worktree / relative).write_text("def test_generated():\n    assert True\n", encoding="utf-8")
     created.append(relative)
 

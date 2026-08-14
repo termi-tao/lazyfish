@@ -745,7 +745,10 @@ def test_accepting_as_written(
     env, worktree, _ = prepared
     write_plan(worktree)
 
-    result = runner.invoke(cli, ["accept"], input="y\n")
+    # "as-is" rather than "y": LF-5 AC15 replaced the yes/no question with a
+    # three-way one, because "yes" and "no" could not express the middle outcome.
+    # The measurement this asserts is unchanged - plan_accepted true, no note.
+    result = runner.invoke(cli, ["accept"], input="as-is\n")
     assert result.exit_code == 0
     row = tasks_of(env)[0]
     assert row.plan_accepted is True

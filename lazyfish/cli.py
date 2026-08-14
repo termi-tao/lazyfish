@@ -25,6 +25,17 @@ import click
 import tomlkit
 
 from . import __version__
+from .artifacts import (
+    CONTRACTS,
+    PROMOTER_HUMAN,
+    PROMOTER_ORCHESTRATOR,
+    ROLE_ORCHESTRATOR,
+    TYPE_REJECTION,
+    TYPE_TECHNICAL_PLAN,
+    Artifact,
+    ArtifactStore,
+    content_id,
+)
 from .config import (
     DEFAULT_ATTACHMENT_MAX_BYTES,
     DEFAULT_ATTACHMENT_MIME_ALLOWLIST,
@@ -38,15 +49,25 @@ from .config import (
     resolve_credentials,
 )
 from .db import (
+    APPROVAL_INTERACTIVE,
+    APPROVAL_NON_INTERACTIVE,
     STATE_ABANDONED,
     STATE_READY_FOR_PLAN,
     Database,
     Task,
     open_db,
 )
-from .errors import LazyfishError
+from .errors import LazyfishError, WorkspaceError
 from .keywords import extract_keywords
-from .paths import config_path, credentials_path, db_path
+from .orchestrator import (
+    PromotionDecision,
+    decide_promotion,
+    ensure_promotable,
+    next_step,
+    state_label,
+)
+from .paths import config_path, credentials_path, data_home, db_path
+from .rejection import Finding, RejectionArtifact, from_human
 from .rendering import Column, render_table
 from .schema import PlanIssue, load_plan, validate_plan
 from .trackers import build_client
@@ -57,6 +78,7 @@ from .workspace import (
     STATE_DIRNAME,
     AttachmentPlan,
     Worktree,
+    base_branch,
     collect_hints,
     create_worktree,
     download_attachments,
@@ -64,6 +86,7 @@ from .workspace import (
     read_conventions,
     remove_worktree,
     render_context,
+    run_git,
     write_ticket_json,
 )
 
@@ -129,6 +152,117 @@ def _worktree_of(task: Task) -> Worktree:
         artifacts_dir=Path(task.artifacts_path),
         created=False,
     )
+
+
+def _artifact_store() -> ArtifactStore:
+    """Where artifact content lives: the data directory, never the repository (D8)."""
+    return ArtifactStore(data_home() / "artifacts")
+
+
+class _Rejected(Exception):
+    """A promotion that did not pass. Carries the decision to the command layer."""
+
+    def __init__(self, decision: PromotionDecision):
+        super().__init__("the plan did not pass its contract")
+        self.decision = decision
+
+
+def _task_awaiting_decision(database: Database, profile: Profile) -> Task:
+    """The task a promotion or an approval applies to.
+
+    Not `get_in_flight`, which only ever returns a task awaiting a plan: the
+    window between prep and approval used to be one state and is now several, so
+    a promoted or rejected task is still the one being worked on. Whether a given
+    state can actually be promoted from is the Orchestrator's answer, not this
+    lookup's.
+    """
+    task = database.get_open(profile.name)
+    if task is None:
+        raise LazyfishError(
+            f"No ticket awaiting a plan for profile '{profile.name}'. Run 'lazyfish prep' first."
+        )
+    if task.accepted_at is not None:
+        raise LazyfishError(
+            f"The plan for {task.ticket_key} was already recorded on "
+            f"{task.accepted_at}. Run 'lazyfish prep' to start the next ticket."
+        )
+    return task
+
+
+def _baseline_for(profile: Profile, task: Task, worktree: Worktree) -> tuple[str, bool]:
+    """The commit promotion judges against. Returns (baseline, was_derived).
+
+    Read from the database, not from git: HEAD, refs and the index are all
+    writable by the party being checked, so a baseline taken from them could be
+    moved by the thing it is supposed to pin down (D4).
+
+    Rows written before this column existed have none. Those do not skip the
+    check -- the one ticket actually in flight when the column arrived is the one
+    that most needs checking -- so the baseline is derived with merge-base and
+    the derivation is announced. Only a failed derivation refuses (AC11).
+    """
+    if task.base_commit:
+        return task.base_commit, False
+
+    base = base_branch(profile)
+    result = run_git(worktree.path, "merge-base", "HEAD", base, check=False)
+    derived = result.stdout.strip() if result.returncode == 0 else ""
+    if not derived:
+        raise WorkspaceError(
+            f"No recorded baseline for {task.ticket_key}, and one could not be derived.\n"
+            f"'git merge-base HEAD {base}' failed in {worktree.path}.\n"
+            f"Set base_branch in the profile to a branch this worktree shares "
+            f"history with, then run promote again."
+        )
+    return derived, True
+
+
+def _previous_findings(
+    database: Database, store: ArtifactStore, task_id: int
+) -> tuple[Finding, ...]:
+    """Findings from the most recent rejection, for the repeat-failure rule (S4).
+
+    Read back from the store rather than kept in memory: a retry is a separate
+    process, so "the same rule as last time" is only answerable from what was
+    persisted.
+    """
+    rejections = [item for item in database.list_artifacts(task_id) if item.type == TYPE_REJECTION]
+    if not rejections:
+        return ()
+    content = store.load(task_id, rejections[-1].id)
+    return tuple(
+        Finding(rule=str(item.get("rule", "")), evidence=str(item.get("evidence", "")))
+        for item in content.get("findings", [])
+    )
+
+
+def _store_rejection(
+    database: Database,
+    store: ArtifactStore,
+    task: Task,
+    rejection: RejectionArtifact,
+    *,
+    baseline: str | None,
+) -> Artifact:
+    """Persist a rejection as an artifact of its own.
+
+    Recorded like any other artifact so that the retry loop leaves a trail that
+    can be counted and routed. `parents` names the plan it judged, which is what
+    keeps an old rejection true about the version it actually saw.
+    """
+    content = rejection.to_dict()
+    artifact = Artifact(
+        id=content_id(content),
+        type=TYPE_REJECTION,
+        produced_by=ROLE_ORCHESTRATOR,
+        task_id=task.id,
+        base_commit=baseline,
+        parents=(rejection.target_artifact,),
+        attempt=rejection.attempt,
+    )
+    recorded = database.record_artifact(artifact)
+    store.store(recorded, content)
+    return recorded
 
 
 def _prepared_block(profile: Profile, task: Task, missing_conventions: Path | None) -> str:
@@ -687,8 +821,14 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
     profile.require_repo()
 
     with _database(ctx) as database:
-        active = database.get_in_flight(profile.name)
-        if active is not None:
+        # One ticket per profile, for the whole window between prep and approval.
+        # That window used to be a single state, and the partial unique index
+        # still covers only that one; now it is several, so the remaining states
+        # are held here. `accepted_at` is the test rather than a list of states:
+        # it is set exactly when a person has made the decision, and it keeps
+        # this check out of the business of naming states (D13).
+        active = database.get_open(profile.name)
+        if active is not None and active.accepted_at is None:
             _handle_active(profile, active)
             return
 
@@ -738,6 +878,12 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
             conventions_path=conventions_path,
         )
 
+        # The baseline is recorded now, while nothing has run in the workspace
+        # yet, and it is read from the source repository rather than from the
+        # workspace: from here on, everything in there is writable by whatever
+        # runs inside it (D4).
+        baseline = run_git(profile.repo, "rev-parse", base_branch(profile)).stdout.strip()
+
         task = database.insert_task(
             ticket_key=ticket.key,
             ticket_title=ticket.title,
@@ -746,6 +892,7 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
             worktree_path=str(worktree.path),
             artifacts_path=str(worktree.artifacts_dir),
             was_top_pick=was_top_pick,
+            base_commit=baseline,
         )
 
     missing = conventions_path if conventions_text is None else None
@@ -799,12 +946,9 @@ def show(ctx: click.Context, as_json: bool) -> None:
     profile = _profile(ctx, config)
 
     with _database(ctx) as database:
-        task = database.get_in_flight(profile.name)
-        if task is None:
-            raise LazyfishError(
-                f"No ticket awaiting a plan for profile '{profile.name}'. "
-                f"Run 'lazyfish prep' first."
-            )
+        # Reading the plan is what the approval gate is for, so this has to work
+        # while the plan is waiting for approval, not only before it was promoted.
+        task = _task_awaiting_decision(database, profile)
         worktree = _worktree_of(task)
         plan = load_plan(worktree.plan_path)
 
@@ -873,6 +1017,204 @@ def _print_list(heading: str, items: list[str]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# next / promote: the two commands a driver uses (D9)
+# --------------------------------------------------------------------------- #
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Print the answer as JSON.")
+@click.pass_context
+def next(ctx: click.Context, as_json: bool) -> None:
+    """Say what the next step is, and where to take it.
+
+    The same answer for a person and for a driver. In JSON form it is the whole
+    interface a runner needs to advance one stage, which is why it is data rather
+    than a sentence: the readable format will change, and anything parsing it
+    would break (D9).
+    """
+    config = _config(ctx)
+    profile = _profile(ctx, config)
+
+    with _database(ctx) as database:
+        task = database.get_open(profile.name)
+        step = next_step(task)
+
+    if as_json:
+        out(json.dumps(step.to_dict(), ensure_ascii=False))
+        return
+
+    if step.state is None:
+        out(f"Nothing in flight for profile '{profile.name}'. Run 'lazyfish prep' to start one.")
+        return
+    if step.blocked_on is not None:
+        out(f"Stopped: {state_label(step.state)}.")
+        out(_field("reason", step.blocked_on))
+        out(_field("ticket", task.ticket_key if task else "-"))
+        return
+    if step.stage is None:
+        out(f"Nothing to do: {state_label(step.state)}.")
+        return
+    out(f"Next stage: {step.stage}")
+    out(_field("workspace", step.workspace or "-"))
+    out(_field("attempt", str(step.attempt)))
+
+
+def _decide(
+    ctx: click.Context,
+    database: Database,
+    profile: Profile,
+    task: Task,
+    *,
+    force: bool,
+) -> tuple[Artifact, str, bool]:
+    """Extract, judge and promote the plan. Returns (artifact, state, bypassed).
+
+    This is the whole of AC1 in one place: the plan is read out of the workspace
+    by contract and nothing else is looked at. An Architect that also implemented
+    the ticket produces exactly the same artifact as one that did not, so those
+    changes are not a violation -- they simply do not exist downstream.
+
+    `force` means a person at a terminal chose to record a plan that failed its
+    contract. It is deliberately not reachable from `promote`, only from `accept`,
+    because anything driving the loop must not be able to skip the check (AC2).
+    """
+    worktree = _worktree_of(task)
+    contract = CONTRACTS[TYPE_TECHNICAL_PLAN]
+    store = _artifact_store()
+
+    plan = contract.extract(worktree.path)
+    identifier = content_id(plan)
+
+    # Promoting the same content again is a no-op, not a second promotion. The
+    # id is the content, so this is decidable without comparing anything else
+    # (AC10). Checked before the state guard, because the state that a repeat
+    # promotion lands in is exactly the one the guard refuses.
+    for existing in database.list_artifacts(task.id):
+        if existing.id == identifier and existing.promoted_at is not None:
+            return existing, task.state, False
+
+    ensure_promotable(task.state)
+    baseline, derived = _baseline_for(profile, task, worktree)
+    if derived:
+        warn(f"no recorded baseline; derived {baseline[:12]} from merge-base.")
+
+    issues = contract.validate(plan, worktree.path)
+    task = database.count_attempt(task.id)
+    artifact = database.record_artifact(
+        Artifact(
+            id=identifier,
+            type=TYPE_TECHNICAL_PLAN,
+            produced_by=contract.produced_by,
+            task_id=task.id,
+            base_commit=baseline,
+            attempt=task.attempt,
+        )
+    )
+    store.store(artifact, plan)
+
+    decision = decide_promotion(
+        artifact_id=identifier,
+        # Forcing says "treat the contract as satisfied": the decision layer is
+        # not told a different plan, it is told a different verdict, and who
+        # promoted it records that a person made that call.
+        issues=[] if force else issues,
+        stage_attempts=task.attempt,
+        ticket_attempts=task.ticket_attempts,
+        previous_findings=_previous_findings(database, store, task.id),
+    )
+
+    if decision.promoted:
+        promoter = PROMOTER_HUMAN if issues else PROMOTER_ORCHESTRATOR
+        artifact = database.promote_artifact(task.id, identifier, promoted_by=promoter)
+        database.set_state(task.id, decision.next_state)
+        # The bypass note is left to the caller: recording the approval rewrites
+        # notes, so a note appended here would be overwritten a moment later.
+        return artifact, decision.next_state, bool(issues)
+
+    assert decision.rejection is not None  # not promoted implies a rejection
+    _store_rejection(database, store, task, decision.rejection, baseline=baseline)
+    database.set_state(task.id, decision.next_state, escalation_reason=decision.escalation_reason)
+    _report_rejection(decision, issues, worktree.plan_path)
+    raise _Rejected(decision)
+
+
+def _report_rejection(
+    decision: PromotionDecision, issues: list[PlanIssue], plan_path: Path
+) -> None:
+    """Explain a rejection to the person who has to act on it."""
+    note(f"{plan_path} does not pass its contract ({len(issues)} problem(s)):")
+    for issue in issues:
+        note(f"  {issue}")
+    note("")
+    if decision.escalation_reason:
+        note(f"Escalated: {decision.escalation_reason}. A person needs to look at this.")
+    elif decision.rejection is not None:
+        note(decision.rejection.required_action)
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Print the outcome as JSON.")
+@click.pass_context
+def promote(ctx: click.Context, as_json: bool) -> None:
+    """Validate the plan in the workspace and promote it, or reject it.
+
+    There is no flag here that skips validation. Promotion is the Orchestrator's
+    authority (D2), and an escape hatch on this command would be reachable by
+    anything driving the loop; the one that exists belongs to `accept`, where a
+    person is present.
+
+    Promoting is not approving. A promoted plan is waiting for a human decision
+    and goes no further on its own (D10, AC13).
+    """
+    config = _config(ctx)
+    profile = _profile(ctx, config)
+
+    with _database(ctx) as database:
+        task = _task_awaiting_decision(database, profile)
+        try:
+            artifact, state, _ = _decide(ctx, database, profile, task, force=False)
+        except _Rejected as rejected:
+            if as_json:
+                out(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "state": rejected.decision.next_state,
+                            "artifact": None,
+                            "rejection": rejected.decision.rejection.to_dict()
+                            if rejected.decision.rejection
+                            else None,
+                            "escalation_reason": rejected.decision.escalation_reason,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ctx.exit(6)
+
+    if as_json:
+        out(
+            json.dumps(
+                {
+                    "ok": True,
+                    "state": state,
+                    "artifact": artifact.to_dict(),
+                    "rejection": None,
+                    "escalation_reason": None,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    out(f"Promoted the plan for {task.ticket_key}.")
+    out(_field("artifact", artifact.id[:12]))
+    out(_field("baseline", (artifact.base_commit or "-")[:12]))
+    out(_field("state", state_label(state)))
+    out("")
+    out("Read it with 'lazyfish show', then approve it with 'lazyfish accept'.")
+
+
+# --------------------------------------------------------------------------- #
 # accept
 # --------------------------------------------------------------------------- #
 
@@ -891,74 +1233,81 @@ def _print_list(heading: str, items: list[str]) -> None:
     is_flag=True,
     help="Accept despite validation errors. Recorded in the task notes.",
 )
+@click.option("--reject", "reject", is_flag=True, help="Turn the plan down; use --note to say why.")
 @click.pass_context
 def accept(
     ctx: click.Context,
     as_is: bool,
     modified: bool,
+    reject: bool,
     note_text: str | None,
     force: bool,
 ) -> None:
-    """Validate the plan and record whether it was taken as written."""
-    if as_is and modified:
-        raise LazyfishError("--as-is and --modified contradict each other.")
+    """Promote the plan, then record your decision about it.
+
+    Three outcomes, not two (D11). "I accepted it after changing it" and "I am
+    turning it down" are different intentions, and the middle one is the bucket
+    the project's own judgement table needs: merging them would silently empty
+    the 40-70% band.
+
+    The question asked at the prompt and the three flags use the same words, so
+    there is one vocabulary to learn rather than two.
+    """
+    named = [
+        flag
+        for flag, given in (("--as-is", as_is), ("--modified", modified), ("--reject", reject))
+        if given
+    ]
+    if len(named) > 1:
+        raise LazyfishError(
+            f"{' and '.join(named)} contradict each other. Each run has one outcome."
+        )
+    if reject and force:
+        raise LazyfishError(
+            "--force cannot be combined with --reject.\n"
+            "--force means 'record it even though validation failed'. Turning a plan "
+            "down needs nothing bypassed: the rejection is the point."
+        )
 
     config = _config(ctx)
     profile = _profile(ctx, config)
 
     with _database(ctx) as database:
-        # get_in_flight only ever returns a READY_FOR_PLAN task, so a plan that
-        # has already been recorded cannot be accepted twice.
-        task = database.get_in_flight(profile.name)
-        if task is None:
-            recorded = database.get_open(profile.name)
-            if recorded is not None:
-                raise LazyfishError(
-                    f"The plan for {recorded.ticket_key} was already recorded on "
-                    f"{recorded.accepted_at}. Run 'lazyfish prep' to start the next "
-                    f"ticket."
-                )
-            raise LazyfishError(
-                f"No ticket awaiting a plan for profile '{profile.name}'. "
-                f"Run 'lazyfish prep' first."
-            )
+        task = _task_awaiting_decision(database, profile)
 
-        worktree = _worktree_of(task)
-        plan = load_plan(worktree.plan_path)
-        issues = validate_plan(plan, worktree.path)
-
-        if issues and not force:
-            _report_issues(issues, worktree.plan_path)
+        # Promote first, always. Approval is a judgement about content, and
+        # nobody should be asked to read a plan that does not even satisfy its
+        # contract (AC13: the order is fixed).
+        try:
+            artifact, _, bypassed = _decide(ctx, database, profile, task, force=force)
+        except _Rejected:
             ctx.exit(6)
 
-        plan_ticket = plan.get("ticket")
+        worktree = _worktree_of(task)
+        plan_ticket = load_plan(worktree.plan_path).get("ticket")
         if isinstance(plan_ticket, str) and plan_ticket != task.ticket_key:
             warn(
                 f"the plan names ticket {plan_ticket}, but the task in flight is {task.ticket_key}."
             )
-
-        if as_is:
-            accepted, notes = True, note_text
-        elif modified:
-            accepted, notes = False, note_text
-        else:
-            accepted = click.confirm(
-                f"Accept the plan for {task.ticket_key} exactly as written?",
-                default=True,
-            )
-            if accepted:
-                notes = note_text
-            else:
-                notes = note_text or click.prompt(
-                    "What did you change, or what was missing?", default="", show_default=False
-                )
-
-        task = database.mark_accepted(task.id, plan_accepted=accepted, notes=notes or None)
-        if issues and force:
-            task = database.append_note(
-                task.id, f"schema bypassed: {len(issues)} unresolved validation issue(s)"
-            )
+        if force:
             warn("plan accepted with --force; the bypass is recorded in the task notes.")
+
+        outcome = named[0] if named else _ask_for_the_outcome(task)
+        via = APPROVAL_NON_INTERACTIVE if named else APPROVAL_INTERACTIVE
+
+        if outcome == "--reject":
+            _record_rejection_by_hand(database, task, artifact, note_text)
+            return
+
+        accepted = outcome == "--as-is"
+        notes = note_text
+        if not accepted and notes is None:
+            notes = _ask_for_a_note("What did you change, or what was missing?")
+        task = database.mark_accepted(
+            task.id, plan_accepted=accepted, notes=notes or None, approved_via=via
+        )
+        if bypassed:
+            task = database.append_note(task.id, "schema bypassed: the contract did not pass")
 
         verdict = "as written" if accepted else "with changes"
         out(f"Recorded {task.ticket_key} as accepted {verdict}.")
@@ -970,13 +1319,61 @@ def accept(
         out(_field("worktree", task.worktree_path))
 
 
-def _report_issues(issues: list[PlanIssue], plan_path: Path) -> None:
-    note(f"{plan_path} does not pass validation ({len(issues)} problem(s)):")
-    for issue in issues:
-        note(f"  {issue}")
-    note("")
-    note("Fix the plan and run 'lazyfish accept' again, or use --force to accept it")
-    note("anyway; a forced accept is recorded in the task notes.")
+ANSWER_AS_IS = "as-is"
+ANSWER_MODIFIED = "modified"
+ANSWER_REJECT = "reject"
+
+_OUTCOME_FLAGS = {
+    ANSWER_AS_IS: "--as-is",
+    ANSWER_MODIFIED: "--modified",
+    ANSWER_REJECT: "--reject",
+}
+
+
+def _ask_for_the_outcome(task: Task) -> str:
+    """The five-second question. Three choices, and it is never skipped for you.
+
+    This question is where the project's primary measurement comes from, which is
+    why approval is never automated: an automated approval would have nowhere to
+    ask it.
+    """
+    answer = click.prompt(
+        f"Plan for {task.ticket_key}: accept it {ANSWER_AS_IS}, accept it "
+        f"{ANSWER_MODIFIED}, or {ANSWER_REJECT} it?",
+        type=click.Choice([ANSWER_AS_IS, ANSWER_MODIFIED, ANSWER_REJECT]),
+        default=ANSWER_AS_IS,
+        show_choices=True,
+    )
+    return _OUTCOME_FLAGS[answer]
+
+
+def _ask_for_a_note(question: str) -> str:
+    return click.prompt(question, default="", show_default=False)
+
+
+def _record_rejection_by_hand(
+    database: Database, task: Task, artifact: Artifact, note_text: str | None
+) -> None:
+    """The third exit: a person turning the plan down (AC15).
+
+    Distinct from a contract rejection in `source`, because a judgement is not a
+    rule violation and conflating them would corrupt both counts. The reason
+    lands on the task as well as in the artifact: `status` and `show` are this
+    slice's only downstream readers, and a reason recorded nowhere a person looks
+    is a reason lost (D14).
+    """
+    reason = note_text if note_text is not None else _ask_for_a_note("Why is it being turned down?")
+    # The attempt comes from the artifact, not from the task row read before the
+    # promotion: promoting charged an attempt, and the rejection belongs to that
+    # attempt rather than to the one before it.
+    rejection = from_human(reason, target_artifact=artifact.id, attempt=artifact.attempt)
+    _store_rejection(database, _artifact_store(), task, rejection, baseline=artifact.base_commit)
+    database.set_state(task.id, STATE_READY_FOR_PLAN, notes=reason or None)
+    out(f"Turned down the plan for {task.ticket_key}.")
+    out(_field("state", state_label(STATE_READY_FOR_PLAN)))
+    out(_field("attempt", str(artifact.attempt)))
+    out("")
+    out("Run the design stage again in the same workspace, then 'lazyfish accept'.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1053,6 +1450,13 @@ def status(ctx: click.Context, all_profiles: bool) -> None:
                     f"{rate * 100:.0f}%" if rate is not None else "n/a",
                 )
             )
+            # Rejections and escalations, counted apart from the acceptances.
+            # "Accepted after changes" and "turned down" are different outcomes
+            # and merging them would empty the middle band of the judgement
+            # table this whole slice exists to fill (AC15).
+            out(_field("rejected", str(stats.rejected)))
+            out(_field("escalated", str(stats.escalated)))
+            out(_field("attempts", str(stats.attempts)))
             out(_field("abandoned", str(stats.abandoned)))
             out(_field("top pick chosen", f"{stats.top_pick_count}/{stats.prepared}"))
             average = stats.average_minutes_to_accept
@@ -1072,8 +1476,14 @@ def status(ctx: click.Context, all_profiles: bool) -> None:
         if open_tasks:
             out("Open worktrees:")
             for task in open_tasks:
-                label = "awaiting plan" if task.state == STATE_READY_FOR_PLAN else "plan recorded"
-                out(f"  {task.profile}: {task.ticket_key} ({label}) {task.worktree_path}")
+                # The label comes from the orchestrator rather than from a
+                # comparison here: this slice adds three states, and a CLI that
+                # had to name them in order to display them would blunt the
+                # guard that keeps decisions out of the CLI (D13).
+                out(
+                    f"  {task.profile}: {task.ticket_key} "
+                    f"({state_label(task.state)}) {task.worktree_path}"
+                )
 
 
 # --------------------------------------------------------------------------- #
