@@ -8,6 +8,7 @@ test is the promoted TestArtifact patch that materialize applies.
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -125,10 +126,21 @@ def patch_after_change(worktree: Path, relative: str, replacement: str) -> str:
     return patch
 
 
-def record_promoted_artifact(
-    env: dict[str, Path], task, *, call_site: str, type_name: str, content: dict
+def record_artifact_for(
+    env: dict[str, Path],
+    task,
+    *,
+    call_site: str,
+    type_name: str,
+    content: dict,
+    promote: bool = True,
 ) -> str:
-    """Persist an artifact exactly as materialize must later consume it."""
+    """Persist an artifact exactly as materialize must later consume it.
+
+    `promote=False` records the row and stores the content but leaves the
+    promotion gate shut, which is the second of the two ways unpromoted
+    content could reach a downstream workspace.
+    """
     from lazyfish.artifacts import Artifact, content_id
 
     identifier = content_id(content)
@@ -144,7 +156,8 @@ def record_promoted_artifact(
         )
         database.record_artifact(artifact)
         artifact_store(env).store(artifact, content)
-        database.promote_artifact(task.id, identifier, promoted_by="orchestrator")
+        if promote:
+            database.promote_artifact(task.id, identifier, promoted_by="orchestrator")
     finally:
         database.close()
     return identifier
@@ -177,7 +190,7 @@ def prepare_materialisation_case(
         worktree, "src/implementation.py", "IMPLEMENTATION = 'promoted implementation'\n"
     )
 
-    test_id = record_promoted_artifact(
+    test_id = record_artifact_for(
         configured,
         task,
         call_site="tester@write",
@@ -189,7 +202,7 @@ def prepare_materialisation_case(
             "test_command": "pytest",
         },
     )
-    record_promoted_artifact(
+    record_artifact_for(
         configured,
         task,
         call_site="coder",
@@ -201,7 +214,7 @@ def prepare_materialisation_case(
             "stats": {"files": 1, "insertions": 1, "deletions": 1},
         },
     )
-    record_promoted_artifact(
+    record_artifact_for(
         configured,
         task,
         call_site="tester@verify",
@@ -579,3 +592,176 @@ def test_abandon_only_removes_the_selected_tickets_workspace_and_branch(
     assert after["PROJ-2"].state != "ABANDONED"
     assert not Path(before["PROJ-1"].worktree_path).exists()
     assert Path(before["PROJ-2"].worktree_path).exists()
+
+
+# The properties below are load-bearing for the LF-6 boundary but had no test:
+# reverting each one leaves the rest of the suite green, which is the whole
+# reason they are written down here (lf6-review-01 section 3).
+
+
+def test_abandon_removes_every_stage_workspace_of_the_ticket(
+    runner: CliRunner,
+    configured: dict[str, Path],
+    repo: Path,
+    tracker: FakeTracker,
+) -> None:
+    """AC16: R3's multi-stage cleanup, which one workspace per ticket cannot show.
+
+    Cleanup scoped to the workspace named on the task row would pass every other
+    AC16 assertion and still orphan a worktree, plus its git registration, for
+    every call site a ticket ran beyond the first.
+    """
+    configured, task, architect = prepare_materialisation_case(runner, configured, repo, tracker)
+    coder = materialize(task, "coder").path
+    ticket_directory = architect.parent
+    assert coder.parent == ticket_directory
+    assert coder != architect
+
+    tracker.tickets = [make_ticket("PROJ-2")]
+    assert runner.invoke(cli, ["prep", "--ticket", "PROJ-2"]).exit_code == 0
+    second = task_of(configured, 1)
+
+    result = runner.invoke(cli, ["abandon", "--ticket", "PROJ-1", "--yes"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert not coder.exists()
+    assert not architect.exists()
+    assert not ticket_directory.exists()
+    assert "PROJ-1" not in git(repo, "worktree", "list")
+    assert Path(second.worktree_path).exists()
+
+
+def test_materialized_workspaces_are_detached_from_every_branch(
+    runner: CliRunner,
+    configured: dict[str, Path],
+    repo: Path,
+    tracker: FakeTracker,
+) -> None:
+    """AC2/AC4: D4 does not trust refs inside a workspace, so it holds none.
+
+    A materialized workspace sitting on the ticket branch would make whatever a
+    stage writes there part of history, which is a second route downstream that
+    never passes the promotion gate; and two call sites would contend for one
+    branch.
+    """
+    configured, task, _ = prepare_materialisation_case(runner, configured, repo, tracker)
+
+    first = materialize(task, "coder").path
+    second = materialize(task, "reviewer@impl").path
+    for workspace in (first, second):
+        with pytest.raises(subprocess.CalledProcessError):
+            git(workspace, "symbolic-ref", "-q", "HEAD")
+    # The branch stays checked out in exactly one place, the workspace prep made.
+    listing = git(first, "worktree", "list").splitlines()
+    holding = [line for line in listing if f"[{task.branch}]" in line]
+    assert len(holding) == 1, listing
+    assert "/architect" in holding[0]
+
+
+def test_materialize_applies_the_last_promoted_artifact_of_a_type(
+    runner: CliRunner,
+    configured: dict[str, Path],
+    repo: Path,
+    tracker: FakeTracker,
+) -> None:
+    """AC4/D12: a retried stage leaves two artifacts of one type; the later wins.
+
+    Taking the earlier one would judge a stage against superseded content while
+    the suite stayed green, because every other fixture promotes each type once.
+    """
+    configured, task, worktree = prepare_materialisation_case(runner, configured, repo, tracker)
+    later = patch_after_change(worktree, "tests/test_outside.py", "TEST = 'second promotion'\n")
+    record_artifact_for(
+        configured,
+        task,
+        call_site="tester@write",
+        type_name="TestArtifact",
+        content={
+            "base_commit": task.base_commit,
+            "patch": later,
+            "coverage": [{"ac_id": "AC1", "test_ids": ["test_outside"]}],
+            "test_command": "pytest",
+        },
+    )
+
+    workspace = materialize(task, "coder").path
+    assert (workspace / "tests/test_outside.py").read_bytes() == b"TEST = 'second promotion'\n"
+
+
+def test_materialize_ignores_a_recorded_but_unpromoted_artifact(
+    runner: CliRunner,
+    configured: dict[str, Path],
+    repo: Path,
+    tracker: FakeTracker,
+) -> None:
+    """AC4: the promotion gate, not the artifact table, decides what flows on.
+
+    Distinct from the unpromoted workspace mutation above: this content is a
+    real artifact row with stored content, and the only thing keeping it out is
+    that nobody promoted it.
+    """
+    configured, task, worktree = prepare_materialisation_case(runner, configured, repo, tracker)
+    unpromoted = patch_after_change(worktree, "tests/test_outside.py", "TEST = 'never promoted'\n")
+    record_artifact_for(
+        configured,
+        task,
+        call_site="tester@write",
+        type_name="TestArtifact",
+        content={
+            "base_commit": task.base_commit,
+            "patch": unpromoted,
+            "coverage": [{"ac_id": "AC1", "test_ids": ["test_outside"]}],
+            "test_command": "pytest",
+        },
+        promote=False,
+    )
+
+    workspace = materialize(task, "coder").path
+    content = (workspace / "tests/test_outside.py").read_text(encoding="utf-8")
+    assert "never promoted" not in content
+    assert content == "TEST = 'promoted outside'\n"
+
+
+def test_notes_are_preserved_or_appended_when_a_task_is_abandoned(tmp_path: Path) -> None:
+    """AC9: D14's reason applies to abandon too, and only accept has a test.
+
+    A human rejection recorded before the task was dropped is the note most
+    worth keeping, and reverting abandon to overwriting notes leaves the accept
+    test green.
+    """
+    database = Database(tmp_path / "lazyfish.db")
+    database.initialise()
+    task = database.insert_task(
+        ticket_key="PROJ-1",
+        ticket_title="Notes fixture",
+        profile="work",
+        branch="lazyfish/PROJ-1",
+        worktree_path=str(tmp_path / "worktree"),
+        artifacts_path=str(tmp_path / "artifacts"),
+        was_top_pick=True,
+    )
+    database.conn.execute(
+        "UPDATE tasks SET state = ?, notes = ? WHERE id = ?",
+        ("PLAN_PROMOTED", "rejected because the rollback path was absent", task.id),
+    )
+    database.conn.commit()
+
+    appended = database.mark_abandoned(task.id, notes="abandoned after a second rejection")
+    assert appended.notes == (
+        "rejected because the rollback path was absent\nabandoned after a second rejection"
+    )
+
+    kept_task = database.insert_task(
+        ticket_key="PROJ-2",
+        ticket_title="Preserved notes fixture",
+        profile="work",
+        branch="lazyfish/PROJ-2",
+        worktree_path=str(tmp_path / "second-worktree"),
+        artifacts_path=str(tmp_path / "second-artifacts"),
+        was_top_pick=False,
+    )
+    database.conn.execute(
+        "UPDATE tasks SET state = ?, notes = ? WHERE id = ?",
+        ("PLAN_PROMOTED", "human rejection survives", kept_task.id),
+    )
+    database.conn.commit()
+    assert database.mark_abandoned(kept_task.id).notes == "human rejection survives"
