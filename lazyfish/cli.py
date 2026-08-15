@@ -54,7 +54,7 @@ from .db import (
     APPROVAL_INTERACTIVE,
     APPROVAL_NON_INTERACTIVE,
     STATE_ABANDONED,
-    STATE_READY_FOR_PLAN,
+    STATE_AWAITING_ARTIFACT,
     Database,
     Task,
     open_db,
@@ -63,9 +63,11 @@ from .errors import LazyfishError, WorkspaceError
 from .keywords import extract_keywords
 from .orchestrator import (
     PromotionDecision,
+    advance_stage,
     decide_promotion,
     ensure_promotable,
     next_step,
+    requires_approval,
     state_label,
 )
 from .paths import config_path, credentials_path, data_home, db_path
@@ -1445,6 +1447,20 @@ def accept(
     with _database(ctx) as database:
         task = _task_awaiting_decision(database, profile, ticket_key)
 
+        # Whether this stage is one a person approves at all (LF-7 D4). Asked of
+        # the authority table rather than worked out from the state: states are
+        # stage-independent, so PROMOTED -> APPROVED is a legal edge everywhere,
+        # and approving at a stage with no gate would be recorded in silence and
+        # then be indistinguishable from a real approval in `plan_accepted`.
+        if not requires_approval(task.current_stage):
+            raise LazyfishError(
+                f"{task.ticket_key} is at the {task.current_stage} stage, which no "
+                f"person approves: its artifact advances as soon as it satisfies "
+                f"its contract.\n"
+                f"Run 'lazyfish promote' to have it judged, or 'lazyfish next' to "
+                f"see what the ticket is waiting for."
+            )
+
         # Promote first, always. Approval is a judgement about content, and
         # nobody should be asked to read a plan that does not even satisfy its
         # contract (AC13: the order is fixed).
@@ -1473,8 +1489,17 @@ def accept(
         notes = note_text
         if not accepted and notes is None:
             notes = _ask_for_a_note("What did you change, or what was missing?")
+        # One answer, two columns: the stage moves and `attempt` is cleared
+        # together, because a stage that starts with the previous one's spent
+        # budget escalates before it has run (LF-7 D5).
+        following, next_state = advance_stage(task.current_stage)
         task = database.mark_accepted(
-            task.id, plan_accepted=accepted, notes=notes or None, approved_via=via
+            task.id,
+            plan_accepted=accepted,
+            next_stage=following,
+            next_state=next_state,
+            notes=notes or None,
+            approved_via=via,
         )
         if bypassed:
             task = database.append_note(task.id, "schema bypassed: the contract did not pass")
@@ -1538,9 +1563,9 @@ def _record_rejection_by_hand(
     # attempt rather than to the one before it.
     rejection = from_human(reason, target_artifact=artifact.id, attempt=artifact.attempt)
     _store_rejection(database, _artifact_store(), task, rejection, baseline=artifact.base_commit)
-    database.set_state(task.id, STATE_READY_FOR_PLAN, notes=reason or None)
+    database.set_state(task.id, STATE_AWAITING_ARTIFACT, notes=reason or None)
     out(f"Turned down the plan for {task.ticket_key}.")
-    out(_field("state", state_label(STATE_READY_FOR_PLAN)))
+    out(_field("state", state_label(STATE_AWAITING_ARTIFACT)))
     out(_field("attempt", str(artifact.attempt)))
     out("")
     out("Run the design stage again in the same workspace, then 'lazyfish accept'.")

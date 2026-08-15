@@ -22,6 +22,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .authority import CALL_SITE_ARCHITECT
 from .schema import PlanIssue
 
 # --------------------------------------------------------------------------- #
@@ -35,11 +36,21 @@ do so automatically; a person judges the content, and that never becomes
 automatic (D10). Recording which one happened keeps the two kinds of rejection
 countable apart in `status`."""
 
-ROUTE_ARCHITECT = "ARCHITECT"
+ROUTE_ARCHITECT = CALL_SITE_ARCHITECT
 ROUTE_HUMAN = "HUMAN"
-"""Where the work goes back to. Only two destinations exist this slice, because
-only one stage does, but the field is here now: adding a destination later is
-cheaper than changing what the field means (D5)."""
+"""Where the work goes back to: a call site, or a person (LF-7 D6).
+
+Raised from role to call site. A role can have two call sites -- the Tester
+writes tests at one and verifies at the other -- so a route naming the role
+cannot say which of them should try again, and routing has to speak the same
+coordinates as the stage sequence it hands the ticket back to.
+
+Nothing observable changes while `architect` is the only stage; that is the
+reason to change the grain now rather than alongside the stage that would make
+the difference visible.
+
+`ROUTE_HUMAN` stays as it is. A person is not a call site.
+"""
 
 SEVERITY_BLOCKING = "blocking"
 """Every rejection is blocking this slice -- a plan either satisfies the contract

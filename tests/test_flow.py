@@ -17,7 +17,7 @@ import pytest
 from click.testing import CliRunner
 
 from lazyfish.cli import cli
-from lazyfish.db import STATE_ABANDONED, STATE_PLAN_APPROVED, Database
+from lazyfish.db import STATE_ABANDONED, STATE_COMPLETED, Database
 from lazyfish.trackers.base import Attachment, Comment
 
 from .conftest import (
@@ -734,7 +734,7 @@ def test_accepting_with_changes_records_the_note(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     row = tasks_of(env)[0]
-    assert row.state == STATE_PLAN_APPROVED
+    assert row.state == STATE_COMPLETED
     assert row.plan_accepted is False
     assert row.notes == "missed the rate limiter"
 

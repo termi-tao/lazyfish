@@ -103,7 +103,7 @@ def test_tickets_already_known_locally_are_marked(
     }
     assert lines["PROJ-1"].strip().startswith("*")
     assert not lines["PROJ-2"].strip().startswith("*")
-    assert "ready for plan" in result.stdout.lower()
+    assert "awaiting artifact" in result.stdout.lower()
 
 
 def test_a_clean_queue_has_no_markers(
@@ -239,7 +239,7 @@ def test_json_output_has_the_documented_shape(
             "known_state",
         }
     assert payload[0]["is_known"] is True
-    assert payload[0]["known_state"] == "READY_FOR_PLAN"
+    assert payload[0]["known_state"] == "AWAITING_ARTIFACT"
     assert payload[1]["is_known"] is False
     assert payload[1]["known_state"] is None
 

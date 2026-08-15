@@ -25,7 +25,7 @@ import pytest
 from click.testing import CliRunner
 
 from lazyfish.cli import cli
-from lazyfish.db import STATE_PLAN_PROMOTED, Database
+from lazyfish.db import STATE_PROMOTED, Database
 from lazyfish.workspace import measure_drift
 
 from .conftest import (
@@ -242,7 +242,7 @@ def test_a_large_drift_still_promotes(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_PROMOTED
+    assert task.state == STATE_PROMOTED
     assert task.workspace_delta_files == EXPECTED_DRIFT_FILES
 
 
@@ -288,7 +288,7 @@ def test_an_unmeasurable_workspace_still_promotes(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_PROMOTED
+    assert task.state == STATE_PROMOTED
     assert task.workspace_delta_files is None
     assert task.workspace_delta_lines is None
     assert "unknown" in (result.stdout + result.stderr).lower()
@@ -361,8 +361,11 @@ def write_lf5_database(path: Path) -> Path:
             INSERT INTO tasks (
                 ticket_key, ticket_title, profile, state, branch, worktree_path,
                 artifacts_path, was_top_pick, prepared_at
-            ) VALUES ('CS-1', 'a real row', 'spendwatt', 'PLAN_APPROVED',
-                      'lazyfish/CS-1', '/w', '/w/a', 1, '2026-08-01T09:00:00+00:00')
+            ) VALUES (
+                'CS-1', 'a real row', 'spendwatt',
+                'PLAN_APPROVED',  -- retired-vocabulary: on purpose
+                'lazyfish/CS-1', '/w', '/w/a', 1, '2026-08-01T09:00:00+00:00'
+            )
             """
         )
         connection.commit()

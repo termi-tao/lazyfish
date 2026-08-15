@@ -7,7 +7,7 @@ Design notes:
 * One live task per ticket is enforced by a partial unique index, not only by a
   check in the CLI. The database, not the caller, is the authority.
 * Illegal state transitions raise instead of silently updating rows: an
-  ABANDONED task must never become PLAN_APPROVED.
+  ABANDONED task must never become APPROVED.
 """
 
 from __future__ import annotations
@@ -21,49 +21,91 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .artifacts import TYPE_REJECTION, Artifact, ensure_authorized
+from .authority import CALL_SITE_ARCHITECT
 from .errors import DatabaseError, StateError
 from .paths import db_path
 
-STATE_READY_FOR_PLAN = "READY_FOR_PLAN"
-STATE_PLAN_PROMOTED = "PLAN_PROMOTED"
-STATE_PLAN_APPROVED = "PLAN_APPROVED"
+STAGE_SEQUENCE_START = CALL_SITE_ARCHITECT
+"""Where a new ticket starts. `orchestrator.STAGE_SEQUENCE` owns the order, but
+this module cannot import it (the orchestrator imports this one), so the first
+entry is named here and pinned to the sequence by a test."""
+
+STATE_AWAITING_ARTIFACT = "AWAITING_ARTIFACT"
+STATE_PROMOTED = "PROMOTED"
+STATE_APPROVED = "APPROVED"
+STATE_COMPLETED = "COMPLETED"
 STATE_REJECTED = "REJECTED"
 STATE_ESCALATED = "ESCALATED"
 STATE_ABANDONED = "ABANDONED"
-"""The state machine's vocabulary.
+"""The state machine's vocabulary, one stage's worth of it (LF-7 D1).
 
-`PLAN_APPROVED` keeps the name and the meaning LF-1 gave it -- the state after a
-person approved -- and `PLAN_PROMOTED` is inserted in front of it rather than
-renaming anything (Q2, trap 2). The two are different transitions, not aliases:
+Every state describes where the *current* stage stands, never which stage that
+is -- that lives in `tasks.current_stage`, and the two dimensions are kept
+orthogonal on purpose:
+
+    AWAITING_ARTIFACT  this stage has not handed anything in yet
+    PROMOTED           what it handed in satisfied its contract
+    APPROVED           a person approved it (only stages with a human gate)
+    COMPLETED          the last stage in the sequence is done
+    REJECTED / ESCALATED / ABANDONED   cross-cutting, stage-independent
+
+The count is therefore constant: adding a stage does not add a state, and
+`LEGAL_TRANSITIONS` below does not change. That is the whole point of LF-7 --
+the alternative (`TESTS_PROMOTED`, `CODE_PROMOTED`, ...) grows a two-dimensional
+edge table quadratically, and a missing edge in it fails silently.
+
+The plan-shaped names LF-1 chose are gone, which START-HERE §7 asked us not to
+do. Its reason was that the partial unique index was keyed on one of them by
+name; LF-6 rekeyed that index to a *set* of live states, so it no longer depends
+on any single name and the constraint's reason expired with it.
+`_rename_legacy_states` below rebuilds the index along with the values, because
+its predicate embeds them as literals.
+
+promote and approve remain different transitions, not aliases:
 
     promote   the Orchestrator judges the artifact against its contract.
               Deterministic, and therefore automatable.
-    approve   a person judges whether the plan is right. Never automatic (D10).
-
-Renaming `PLAN_APPROVED` would have moved the partial unique index below, which
-is a structural guarantee rather than an application-level check. Inserting a
-state leaves the index untouched; LF-6 changed its key, and did so as a stated
-decision with a migration rather than as a side effect of a rename.
+    approve   a person judges whether the work is right. Never automatic (D10).
 """
 
-ACTIVE_STATES = (STATE_READY_FOR_PLAN, STATE_PLAN_APPROVED)
+LEGACY_STATES: dict[str, str] = {
+    "READY_FOR_PLAN": STATE_AWAITING_ARTIFACT,  # retired-vocabulary: on purpose
+    "PLAN_PROMOTED": STATE_PROMOTED,  # retired-vocabulary: on purpose
+    # Not APPROVED. In the vocabulary that wrote these rows there was one stage,
+    # so approving the plan *was* the end of the ticket; under the new meaning
+    # APPROVED is one stage's gate and something comes after it. Translating it
+    # literally would bring every finished ticket back to life, with no rule
+    # broken anywhere to notice it (D3).
+    "PLAN_APPROVED": STATE_COMPLETED,  # retired-vocabulary: on purpose
+}
+"""Old state name -> new one. The only semantic judgement this migration makes."""
+
+ACTIVE_STATES = (STATE_AWAITING_ARTIFACT, STATE_COMPLETED)
 
 LIVE_STATES = (
-    STATE_READY_FOR_PLAN,
-    STATE_PLAN_PROMOTED,
+    STATE_AWAITING_ARTIFACT,
+    STATE_PROMOTED,
+    STATE_APPROVED,
     STATE_REJECTED,
     STATE_ESCALATED,
 )
 """The states in which a ticket is still lazyfish's business (LF-6 D9/D10).
 
-The window from prep to a person's decision. `PLAN_APPROVED` is outside it --
-once the plan is recorded lazyfish's part is over and the same ticket may be
-prepared again -- and so is `ABANDONED`.
+Everything except `COMPLETED` and `ABANDONED`, which is a change of definition
+rather than of membership: this used to say "up to the person's decision", and
+the approved state was outside the window because approving the plan ended the
+ticket. With a stage sequence that is no longer true -- approval ends a *stage*
+-- so `APPROVED` is inside the window and `COMPLETED` is the state that means
+lazyfish is finished with the ticket.
 
-This list is what "in flight" now means, and it is read by three things that
-must not disagree: the unique index below, the ambiguity check that decides
-whether a command needs `--ticket`, and `get_live`. One definition, because
-a second copy of it would drift the moment a state is inserted.
+Nothing observable changes while the sequence has one entry: `accept` approves
+and advances in the same breath, finds no next stage, and lands on `COMPLETED`,
+which is outside the window exactly where the approved state used to be.
+
+This list is what "in flight" means, and it is read by three things that must
+not disagree: the unique index below, the ambiguity check that decides whether a
+command needs `--ticket`, and `get_live`. One definition, because a second copy
+of it would drift the moment a state is inserted.
 """
 
 APPROVAL_INTERACTIVE = "interactive"
@@ -84,30 +126,49 @@ legible rather than forbidding it.
 # Listed in each row rather than special-cased in check_transition, so the table
 # stays the single description of the machine.
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
-    # The edge LF-1 had here, READY_FOR_PLAN -> PLAN_APPROVED, is deliberately
-    # gone (D7): a plan cannot be approved before it has been promoted, and the
-    # order is enforced by the table rather than by whoever remembers it (AC13).
-    STATE_READY_FOR_PLAN: frozenset(
-        {STATE_PLAN_PROMOTED, STATE_REJECTED, STATE_ESCALATED, STATE_ABANDONED}
+    # The edge LF-1 had here, straight to approval, is deliberately gone (D7):
+    # nothing can be approved before it has been promoted, and the order is
+    # enforced by the table rather than by whoever remembers it (AC13).
+    STATE_AWAITING_ARTIFACT: frozenset(
+        {STATE_PROMOTED, STATE_REJECTED, STATE_ESCALATED, STATE_ABANDONED}
     ),
     # A rejection is the retry loop, not the end of a ticket: the next attempt
-    # promotes from here. READY_FOR_PLAN is reachable again so that routing can
-    # send the ticket back for a fresh attempt.
+    # promotes from here. AWAITING_ARTIFACT is reachable again so that routing
+    # can send the ticket back for a fresh attempt.
     STATE_REJECTED: frozenset(
-        {STATE_PLAN_PROMOTED, STATE_READY_FOR_PLAN, STATE_ESCALATED, STATE_ABANDONED}
+        {STATE_PROMOTED, STATE_AWAITING_ARTIFACT, STATE_ESCALATED, STATE_ABANDONED}
     ),
-    # Awaiting approval. PLAN_APPROVED is the person saying yes; READY_FOR_PLAN
-    # is the person saying no, which is AC15's third exit. Nothing downstream is
-    # reachable from here, which is what makes the approval gate a real gate.
-    STATE_PLAN_PROMOTED: frozenset({STATE_PLAN_APPROVED, STATE_READY_FOR_PLAN, STATE_ABANDONED}),
-    STATE_PLAN_APPROVED: frozenset({STATE_ABANDONED}),
+    # Awaiting approval, at the stages that have a gate. APPROVED is the person
+    # saying yes; AWAITING_ARTIFACT is the person saying no, which is AC15's
+    # third exit. Nothing advances from here on its own, which is what makes the
+    # approval gate a real gate.
+    STATE_PROMOTED: frozenset(
+        {STATE_APPROVED, STATE_AWAITING_ARTIFACT, STATE_COMPLETED, STATE_ABANDONED}
+    ),
+    # Approval ends a stage, not the ticket. The next stage starts by awaiting
+    # its artifact; the last one has nowhere to go and completes.
+    STATE_APPROVED: frozenset({STATE_AWAITING_ARTIFACT, STATE_COMPLETED, STATE_ABANDONED}),
     # Escalation is a stop, not a step: a person decides what happens next, and
     # the only move the tool itself offers is to abandon the ticket.
     STATE_ESCALATED: frozenset({STATE_ABANDONED}),
+    # Kept from the old approved row rather than reasoned about again (Q1):
+    # tidying up a finished ticket must not be blocked, and whether "abandon"
+    # is the right word for that is a separate question with no evidence yet.
+    STATE_COMPLETED: frozenset({STATE_ABANDONED}),
     STATE_ABANDONED: frozenset(),
 }
+"""Stage-independent by construction. Adding a stage must not change this table.
 
-SCHEMA_VERSION = 1
+`PROMOTED -> COMPLETED` exists for stages with no human gate: they finish the
+moment their artifact passes, and if such a stage is last, that is the end of
+the ticket without an approval ever happening.
+"""
+
+SCHEMA_VERSION = 2
+"""Bumped by LF-7, the first migration that rewrites values rather than adding
+to the shape. A build older than this one cannot read `current_stage` and would
+write rows the new vocabulary cannot interpret, so `_refuse_a_newer_schema`
+turning it away is the point of the version rather than a side effect."""
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -152,7 +213,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- implementation" is a measurable rate rather than an impression. NULL means
     -- not measured, which includes rows written before C1.
     workspace_delta_files INTEGER,
-    workspace_delta_lines INTEGER
+    workspace_delta_lines INTEGER,
+    -- Which call site the ticket is at (LF-7 D2). The progress dimension, kept
+    -- out of `state` so that adding a stage adds a row to a sequence rather
+    -- than a state to a machine. A call site, not a role: a role can have more
+    -- than one, and any count taken from roles is wrong (LF-6).
+    current_stage  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, profile);
@@ -202,7 +268,7 @@ LIVE_TICKET_INDEX_SQL = (
 )
 """The structural guarantee, rekeyed (D9).
 
-    was     ON tasks (profile)              WHERE state = 'READY_FOR_PLAN'
+    was     ON tasks (profile)              WHERE state = <the awaiting one>
             one ticket per profile at a time
     now     ON tasks (profile, ticket_key)  WHERE state IN (the live window)
             one live task per ticket
@@ -226,6 +292,8 @@ ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     # C1
     ("workspace_delta_files", "workspace_delta_files INTEGER"),
     ("workspace_delta_lines", "workspace_delta_lines INTEGER"),
+    # LF-7
+    ("current_stage", "current_stage TEXT"),
 )
 """Columns added to `tasks` after its first shape, oldest first.
 
@@ -291,6 +359,9 @@ class Task:
     approved_via: str | None = None
     workspace_delta_files: int | None = None
     workspace_delta_lines: int | None = None
+    # Which call site the ticket is at (LF-7). NULL on rows migrated from a
+    # build that had no such column; `_rename_legacy_states` fills those in.
+    current_stage: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -316,6 +387,7 @@ class Task:
             approved_via=row["approved_via"],
             workspace_delta_files=row["workspace_delta_files"],
             workspace_delta_lines=row["workspace_delta_lines"],
+            current_stage=row["current_stage"],
         )
 
     def minutes_to_accept(self) -> float | None:
@@ -512,8 +584,34 @@ class Database:
         with self.conn:
             self.conn.executescript(SCHEMA_SQL)
             self._add_missing_columns()
+            self._rename_legacy_states()
             self._rekey_live_ticket_index()
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _rename_legacy_states(self) -> None:
+        """Translate the pre-LF-7 vocabulary, and record which stage those rows are at.
+
+        Runs before the index rekey, and the order is load-bearing: the index's
+        predicate lists the live states as literals, so an index rebuilt before
+        the values move would be built against rows that are about to change
+        underneath it. Renaming first, rebuilding second, both inside
+        `initialise`'s transaction, is the only order in which the file is never
+        observed with a predicate that matches nothing.
+
+        Idempotent the same way the column migration is: the second run matches
+        zero rows, because the names it looks for are gone. Nothing is derived
+        from `user_version` -- a file written by a build that crashed halfway is
+        exactly the case a version check gets wrong.
+
+        Every migrated row is at `architect`, which is not an assumption: it is
+        the only call site any build up to now could produce.
+        """
+        for old, new in LEGACY_STATES.items():
+            self.conn.execute("UPDATE tasks SET state = ? WHERE state = ?", (new, old))
+        self.conn.execute(
+            "UPDATE tasks SET current_stage = ? WHERE current_stage IS NULL",
+            (CALL_SITE_ARCHITECT,),
+        )
 
     def _refuse_a_newer_schema(self) -> None:
         """Stop if the file was written by a build that knows more than this one.
@@ -547,12 +645,32 @@ class Database:
         conditional -- `initialise()` runs on every open, and a second run that
         threw would turn a migration into a one-shot.
 
-        Correct on all three shapes of file: a new database has neither index and
+        Correct on all four shapes of file: a new database has neither index and
         gets the new one; a current database has it already and nothing happens;
         an older database has the old index, which is dropped, and gains the new
-        one. No row is read or written either way.
+        one; and a database whose index has the right *name* but a stale
+        predicate is rebuilt, which is the shape LF-7 creates.
+
+        That last case is why the predicate is compared rather than assumed.
+        `CREATE UNIQUE INDEX IF NOT EXISTS` matches on the name alone, so an
+        index listing state names this build no longer writes would survive
+        untouched and then match no rows at all -- the unique constraint would
+        be gone, silently, with every test still green because nothing else
+        inserts a duplicate. Comparing the stored definition also means any
+        future change to `LIVE_STATES` rebuilds the index without anyone having
+        to remember that it should.
+
+        No row is read or written either way.
         """
         self.conn.execute(f"DROP INDEX IF EXISTS {LEGACY_WIP_INDEX}")
+        stored = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (LIVE_TICKET_INDEX,),
+        ).fetchone()
+        # SQLite stores the statement without "IF NOT EXISTS", so compare against
+        # the same shape rather than against what we would execute.
+        if stored is not None and stored[0] != LIVE_TICKET_INDEX_SQL.replace("IF NOT EXISTS ", ""):
+            self.conn.execute(f"DROP INDEX {LIVE_TICKET_INDEX}")
         try:
             self.conn.execute(LIVE_TICKET_INDEX_SQL)
         except sqlite3.IntegrityError as exc:
@@ -639,20 +757,25 @@ class Database:
                 INSERT INTO tasks (
                     ticket_key, ticket_title, profile, state, branch,
                     worktree_path, artifacts_path, was_top_pick, prepared_at,
-                    base_commit
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    base_commit, current_stage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticket_key,
                     ticket_title,
                     profile,
-                    STATE_READY_FOR_PLAN,
+                    STATE_AWAITING_ARTIFACT,
                     branch,
                     worktree_path,
                     artifacts_path,
                     int(was_top_pick),
                     utc_now(),
                     base_commit,
+                    # The first stage in the sequence. Written at insert rather
+                    # than defaulted in the schema so that the column is never
+                    # NULL on a row this build created -- NULL means "migrated",
+                    # and the two should stay distinguishable.
+                    STAGE_SEQUENCE_START,
                 ),
             )
         task = self.get(int(cursor.lastrowid))
@@ -664,15 +787,34 @@ class Database:
         task_id: int,
         *,
         plan_accepted: bool,
+        next_stage: str | None,
+        next_state: str,
         notes: str | None = None,
         approved_via: str | None = None,
     ) -> Task:
-        """Record a person's approval of the plan.
+        """Record a person's approval, and move the ticket on in the same breath.
 
-        Only reachable from `PLAN_PROMOTED`: the transition table no longer has
-        an edge from `READY_FOR_PLAN`, so a plan that has not passed its contract
-        cannot be approved (AC13). Nobody should be asked to read a plan that
-        does not even parse.
+        Only reachable from `PROMOTED`: the transition table has no edge from
+        `AWAITING_ARTIFACT`, so work that has not passed its contract cannot be
+        approved (AC13). Nobody should be asked to read a plan that does not
+        even parse.
+
+        Approval and advancement are one write because they are one event, and
+        splitting them leaves a crash between the two with the ticket approved
+        and parked at a stage it has already finished. Both edges are still
+        checked -- into `APPROVED` and out of it -- so the pair being atomic
+        does not make either of them unexamined.
+
+        `next_stage` and `next_state` come from `orchestrator.advance_stage`,
+        which is also where `attempt` being cleared is decided; the clearing
+        happens here because this is the statement that moves the stage, and the
+        two must not be separable (LF-7 D5).
+
+        `attempt` is cleared only when the stage actually changes. At the end of
+        the sequence nothing moves, and zeroing there would erase how many
+        attempts the last stage took -- which is one of the numbers this tool
+        exists to collect, and it would be erased at exactly the moment the
+        ticket finishes.
 
         `approved_via` records how the decision was made, not what it was.
 
@@ -683,18 +825,22 @@ class Database:
         attempt was wrong. Given nothing, the column is left as it is.
         """
         task = self._require(task_id)
-        check_transition(task.state, STATE_PLAN_APPROVED)
+        check_transition(task.state, STATE_APPROVED)
+        check_transition(STATE_APPROVED, next_state)
         merged = _merge_notes(task.notes, notes)
         with self.conn:
             self.conn.execute(
                 """
                 UPDATE tasks
-                   SET state = ?, plan_accepted = ?, notes = ?, accepted_at = ?,
+                   SET state = ?, current_stage = ?, attempt = ?,
+                       plan_accepted = ?, notes = ?, accepted_at = ?,
                        approved_via = ?
                  WHERE id = ?
                 """,
                 (
-                    STATE_PLAN_APPROVED,
+                    next_state,
+                    next_stage if next_stage is not None else task.current_stage,
+                    0 if next_stage is not None else task.attempt,
                     int(plan_accepted),
                     merged,
                     utc_now(),
@@ -875,7 +1021,7 @@ class Database:
         """The task awaiting a plan for a profile. At most one by construction."""
         row = self.conn.execute(
             "SELECT * FROM tasks WHERE profile = ? AND state = ? ORDER BY id DESC LIMIT 1",
-            (profile, STATE_READY_FOR_PLAN),
+            (profile, STATE_AWAITING_ARTIFACT),
         ).fetchone()
         return Task.from_row(row) if row else None
 
@@ -988,7 +1134,7 @@ class Database:
                     accepted_as_is=sum(1 for t in tasks if t.plan_accepted is True),
                     accepted_modified=sum(1 for t in tasks if t.plan_accepted is False),
                     abandoned=sum(1 for t in tasks if t.state == STATE_ABANDONED),
-                    in_flight=sum(1 for t in tasks if t.state == STATE_READY_FOR_PLAN),
+                    in_flight=sum(1 for t in tasks if t.state == STATE_AWAITING_ARTIFACT),
                     top_pick_count=sum(1 for t in tasks if t.was_top_pick),
                     average_minutes_to_accept=(
                         sum(durations) / len(durations) if durations else None

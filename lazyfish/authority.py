@@ -74,6 +74,14 @@ surface is one list, not two. Materialisation ignores them: they reach a
 workspace as context files, not as a patch applied to the base commit.
 """
 
+PSEUDO_INPUTS = frozenset({INPUT_TICKET, INPUT_ACCEPTANCE_CRITERIA})
+"""The two above, as a set, for callers that need the artifact half of `consumes`.
+
+`next_step` is one: what a runner has to fetch and apply is the promoted
+artifacts, and a context file the workspace already contains is not something it
+can act on.
+"""
+
 
 # --------------------------------------------------------------------------- #
 # The table
@@ -88,6 +96,20 @@ class CallSite:
     role: str
     produces: tuple[str, ...]
     consumes: tuple[str, ...]
+    human_gate: bool = False
+    """Whether a person approves this call site's artifact before the next runs.
+
+    The third question this table answers, and it is here for the same reason as
+    the other two: it is a fact about a call site, and the alternative is for
+    `accept` to work it out from the state, which cannot -- states are
+    stage-independent by design (LF-7 D1), so `PROMOTED -> APPROVED` is a legal
+    edge everywhere and approving at a stage with no gate would be accepted in
+    silence. That row would then be indistinguishable from a real approval in
+    the statistics `plan_accepted` feeds (LF-7 D4).
+
+    Exactly one call site has a gate today, and the design says approval of the
+    plan is the one decision that is never automated (D10).
+    """
 
 
 CALL_SITES: dict[str, CallSite] = {
@@ -96,6 +118,7 @@ CALL_SITES: dict[str, CallSite] = {
         role=ROLE_ARCHITECT,
         produces=(TYPE_TECHNICAL_PLAN,),
         consumes=(INPUT_TICKET,),
+        human_gate=True,
     ),
     # No implementation and no tests: the tests are what it is here to write,
     # and it has to write them against the ticket rather than against code that
@@ -187,6 +210,22 @@ def produces_for(call_site: str) -> tuple[str, ...]:
 def consumes_for(call_site: str) -> tuple[str, ...]:
     """Inputs this call site's workspace is materialised from (AC5)."""
     return _require(call_site).consumes
+
+
+def consumes_artifacts_for(call_site: str) -> tuple[str, ...]:
+    """The artifact types in this call site's read surface, pseudo-inputs removed."""
+    return tuple(item for item in consumes_for(call_site) if item not in PSEUDO_INPUTS)
+
+
+def has_human_gate(call_site: str) -> bool:
+    """Whether a person approves this call site's artifact (LF-7 D4).
+
+    An unknown call site has no gate, for the same reason an unknown one may not
+    produce anything: the safe answer to "should a person be asked about this
+    thing I do not recognise" is that there is nothing here to approve.
+    """
+    site = CALL_SITES.get(call_site)
+    return site is not None and site.human_gate
 
 
 def may_produce(call_site: str, artifact_type: str) -> bool:

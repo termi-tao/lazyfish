@@ -29,12 +29,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .authority import CALL_SITE_ARCHITECT, CALL_SITES, consumes_artifacts_for, has_human_gate
 from .db import (
     STATE_ABANDONED,
+    STATE_APPROVED,
+    STATE_AWAITING_ARTIFACT,
+    STATE_COMPLETED,
     STATE_ESCALATED,
-    STATE_PLAN_APPROVED,
-    STATE_PLAN_PROMOTED,
-    STATE_READY_FOR_PLAN,
+    STATE_PROMOTED,
     STATE_REJECTED,
 )
 from .errors import StateError
@@ -53,8 +55,43 @@ from .schema import PlanIssue
 # Stages
 # --------------------------------------------------------------------------- #
 
-STAGE_ARCHITECT = "architect"
-"""The only stage implemented this slice. The others arrive with their contracts."""
+STAGE_ARCHITECT = CALL_SITE_ARCHITECT
+"""Kept as an alias: LF-5 named stages, LF-6 named call sites, and they are the
+same list seen from two slices. A stage *is* a call site (LF-7 D2)."""
+
+STAGE_SEQUENCE: tuple[str, ...] = (CALL_SITE_ARCHITECT,)
+"""The pipeline, in order. The one place the order exists (LF-7 D2).
+
+One entry, which is what keeps LF-7 a refactor: the machine can express a
+sequence, and the sequence has nothing in it yet. Adding a stage is inserting an
+item here, adding a row to `authority.CALL_SITES`, and registering a contract --
+`LEGAL_TRANSITIONS` and the state vocabulary must not move.
+
+Reordering is reordering this tuple. That is not a hypothetical convenience: the
+Tester was moved from after the Coder to before it while this was still on
+paper, and there is no reason to think it was the last such change.
+
+Call sites rather than roles, because a role can have two of them and any count
+taken from roles is wrong (LF-6).
+"""
+
+
+def next_stage(stage: str | None) -> str | None:
+    """The stage after this one, or None at the end of the sequence.
+
+    An unknown stage returns None rather than raising: it means a database
+    written by a build whose sequence had something this one does not, and the
+    honest answer to "what comes after a stage I do not know" is that this build
+    cannot say.
+    """
+    if stage is None:
+        return None
+    try:
+        position = STAGE_SEQUENCE.index(stage)
+    except ValueError:
+        return None
+    following = STAGE_SEQUENCE[position + 1 :]
+    return following[0] if following else None
 
 
 # --------------------------------------------------------------------------- #
@@ -132,13 +169,13 @@ def route_for(
 # Promotable states (AC13)
 # --------------------------------------------------------------------------- #
 
-PROMOTABLE_STATES = frozenset({STATE_READY_FOR_PLAN, STATE_REJECTED})
+PROMOTABLE_STATES = frozenset({STATE_AWAITING_ARTIFACT, STATE_REJECTED})
 """States a promotion may be attempted from.
 
 `REJECTED` is in the set because a rejection is not the end of a ticket -- it is
-the retry loop. `PLAN_PROMOTED` is not: promoting twice would mean the approval
-gate can be re-entered from underneath, and `PLAN_APPROVED` is not either,
-because the order of promote and approve is fixed (AC13).
+the retry loop. `PROMOTED` is not: promoting twice would mean the approval gate
+can be re-entered from underneath, and `APPROVED` is not either, because the
+order of promote and approve is fixed (AC13).
 """
 
 
@@ -146,7 +183,7 @@ def ensure_promotable(state: str) -> None:
     """Raise unless a promotion may be attempted from `state`."""
     if state in PROMOTABLE_STATES:
         return
-    if state == STATE_PLAN_PROMOTED:
+    if state == STATE_PROMOTED:
         raise StateError(
             "This plan has already been promoted and is waiting for approval.\n"
             "Run 'lazyfish show' to read it, then 'lazyfish accept'."
@@ -206,7 +243,7 @@ def decide_promotion(
     version it judged -- after a retry the task has two plans (D5).
     """
     if not issues:
-        return PromotionDecision(promoted=True, next_state=STATE_PLAN_PROMOTED)
+        return PromotionDecision(promoted=True, next_state=STATE_PROMOTED)
 
     reason = budget_exceeded(stage_attempts=stage_attempts, ticket_attempts=ticket_attempts)
     route = ROUTE_HUMAN if reason else route_for(_findings_of(issues), previous_findings)
@@ -248,14 +285,18 @@ the normal case indistinguishable from a failure in the data.
 """
 
 _STOPPED_ON = {
-    STATE_PLAN_PROMOTED: BLOCKED_ON_HUMAN_APPROVAL,
+    STATE_PROMOTED: BLOCKED_ON_HUMAN_APPROVAL,
     STATE_ESCALATED: BLOCKED_ON_ESCALATION,
 }
 
-_STAGE_FOR = {
-    STATE_READY_FOR_PLAN: STAGE_ARCHITECT,
-    STATE_REJECTED: STAGE_ARCHITECT,
-}
+_WORKING_STATES = frozenset({STATE_AWAITING_ARTIFACT, STATE_REJECTED})
+"""States in which the current stage still has work to hand in.
+
+This replaces the state -> stage table LF-5 had. That table could only exist
+while there was one stage to map every state to; which stage a task is at is now
+a fact about the task, not about its state (LF-7 D2), and these two states are
+the ones where that stage has something to do.
+"""
 
 
 @dataclass(frozen=True)
@@ -286,10 +327,11 @@ class NextStep:
 
 
 STATE_LABELS = {
-    STATE_READY_FOR_PLAN: "awaiting plan",
-    STATE_PLAN_PROMOTED: "awaiting approval",
-    STATE_PLAN_APPROVED: "plan recorded",
-    STATE_REJECTED: "rejected, awaiting a new plan",
+    STATE_AWAITING_ARTIFACT: "awaiting the stage's artifact",
+    STATE_PROMOTED: "awaiting approval",
+    STATE_APPROVED: "approved",
+    STATE_COMPLETED: "completed",
+    STATE_REJECTED: "rejected, awaiting another attempt",
     STATE_ESCALATED: "escalated",
     STATE_ABANDONED: "abandoned",
 }
@@ -310,21 +352,57 @@ def state_label(state: str) -> str:
 def next_step(task: Any | None) -> NextStep:
     """What to do next for one task, or for no task at all.
 
-    `PLAN_PROMOTED` yields no stage. That is D10 expressed as data: a runner
-    asking this question is told to stop, because approval is not a transition
-    it has. The gate holds by construction rather than by policy.
+    `PROMOTED` yields no stage. That is D10 expressed as data: a runner asking
+    this question is told to stop, because approval is not a transition it has.
+    The gate holds by construction rather than by policy.
+
+    The stage is read from the task, not derived from its state (LF-7 D2). What
+    the state decides is only whether that stage still owes an artifact.
     """
     if task is None:
         return NextStep(
             state=None, stage=None, workspace=None, consumes=(), blocked_on=None, attempt=0
         )
+    stage = getattr(task, "current_stage", None)
+    working = task.state in _WORKING_STATES
     return NextStep(
         state=task.state,
-        stage=_STAGE_FOR.get(task.state),
+        stage=stage if working else None,
         workspace=task.worktree_path,
-        # The authority table: the Architect consumes the Ticket, which is not a
-        # promoted artifact. The first stage has no artifact inputs by design.
-        consumes=(),
+        # From the authority table rather than a second list, and artifacts
+        # only: the Architect reads the Ticket, which is not something a runner
+        # fetches and applies, so the first stage's tuple is empty by design
+        # rather than by omission.
+        consumes=consumes_artifacts_for(stage) if working and stage in CALL_SITES else (),
         blocked_on=_STOPPED_ON.get(task.state),
         attempt=getattr(task, "attempt", 0) or 0,
     )
+
+
+def advance_stage(stage: str | None) -> tuple[str | None, str]:
+    """Where a task goes once the current stage is done: (next stage, next state).
+
+    The only place a stage changes, and therefore the only place `attempt` is
+    cleared -- the caller writes both from this one answer (LF-7 D5). `db.py`
+    has promised since LF-5 that `attempt` "resets when the stage does", and
+    until now no stage ever did, so nothing kept the promise. Splitting the two
+    across call sites is how the next stage inherits a budget it never spent.
+
+    The end of the sequence is `COMPLETED`, which is what makes approval of the
+    last stage the end of lazyfish's involvement -- exactly where the old
+    approved state sat while `architect` was the whole pipeline.
+    """
+    following = next_stage(stage)
+    if following is None:
+        return None, STATE_COMPLETED
+    return following, STATE_AWAITING_ARTIFACT
+
+
+def requires_approval(stage: str | None) -> bool:
+    """Whether this stage's artifact waits for a person (LF-7 D4).
+
+    A thin pass-through to the authority table on purpose. The question belongs
+    to the table; what belongs here is that the *decision* to ask it lives in the
+    Orchestrator rather than in whichever command happens to need the answer.
+    """
+    return stage is not None and has_human_gate(stage)
