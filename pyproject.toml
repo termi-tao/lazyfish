@@ -27,7 +27,7 @@ dependencies = [
     "jinja2>=3.1",
     "jsonschema>=4.21",
     # Style-preserving TOML. `lazyfish init` edits a file the user owns, so a
-    # second run must not delete their comments (LF-2 D7).
+    # second run must not delete their comments.
     "tomlkit>=0.12",
 ]
 
@@ -38,8 +38,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/lazyfish-dev/lazyfish"
-Issues = "https://github.com/lazyfish-dev/lazyfish/issues"
+Homepage = "https://github.com/termi-tao/lazyfish"
+Issues = "https://github.com/termi-tao/lazyfish/issues"
 
 [project.scripts]
 lazyfish = "lazyfish.cli:main"

@@ -85,6 +85,16 @@ pull request for you.
 pipx install lazyfish     # or: uv tool install lazyfish
 ```
 
+Not on PyPI yet. Until the first release, install from the repository:
+
+```sh
+pipx install "git+https://github.com/termi-tao/lazyfish.git"
+```
+
+A git install has no version to compare, so `pipx upgrade` will report it is
+already current after a new commit lands. Use `pipx upgrade lazyfish --force`,
+or install with `-e` from a clone and let `git pull` be the upgrade.
+
 Requires Python 3.11+ and `git`. [ripgrep](https://github.com/BurntSushi/ripgrep)
 is optional; without it the code search falls back to a slower built-in scan.
 
@@ -97,6 +107,12 @@ lazyfish init
 Seven questions - profile name, Atlassian site, account email, API token, the
 query that selects candidate tickets, the local path to the repository, and an
 optional reminder - and you have a working profile. Run it again per project.
+
+`init --check` finishes by calling the tracker once, so a wrong token or a
+mistyped site fails now rather than on your first `prep`. Every answer can also
+be given as an option (`--profile`, `--base-url`, `--email`, `--api-token`,
+`--query`, `--repository`, `--account-note`); with `--yes` it asks nothing,
+which is the form to use from a script.
 
 lazyfish keeps two files, both in `~/.config/lazyfish/` and nowhere else:
 
@@ -320,19 +336,27 @@ Candidates (5):
    ...
 Prepared PROJ-412: Password reset email links expire too early
   profile           work
-  branch        lazyfish/PROJ-412
-  worktree      ~/.local/share/lazyfish/worktrees/default/PROJ-412
-  context       .../PROJ-412/CLAUDE.md
-  design brief  .../PROJ-412/.lazyfish/plan-prompt.md
-  write plan to .../PROJ-412/.lazyfish/plan.json
+  branch            lazyfish/PROJ-412
+  worktree          ~/.local/share/lazyfish/worktrees/work/PROJ-412/architect
+  context           .../PROJ-412/architect/CLAUDE.md
+  design brief      .../PROJ-412/architect/.lazyfish/plan-prompt.md
+  write plan to     .../PROJ-412/architect/.lazyfish/plan.json
 
 Open the worktree, run the AI tool of your choice, then 'lazyfish show' and 'lazyfish accept'.
-cd /home/you/.local/share/lazyfish/worktrees/default/PROJ-412
+cd /home/you/.local/share/lazyfish/worktrees/work/PROJ-412/architect
 ```
+
+The path is `<worktree_root>/<profile>/<KEY>/<stage>`. Both middle levels earn
+their place: the profile, so two profiles working the same ticket key do not
+land in one directory, and the stage, so a later stage's workspace can be built
+without destroying the one you can still read.
 
 `CLAUDE.md` in that worktree holds the ticket text, its comments, the
 attachments that were small and text-like enough to inline, your conventions
 file, and a clearly labelled block of mechanical search hits.
+
+`prep --no-hints` skips the mechanical code search when the ticket does not need
+it, or when the repository is large enough that the scan is the slow part.
 
 Design however you like, write `.lazyfish/plan.json`, then:
 
@@ -407,6 +431,42 @@ cannot express:
 If a rule is wrong for your situation, `lazyfish accept --force` records the
 plan anyway and writes the bypass into the task notes, so the statistics stay
 honest.
+
+## Troubleshooting
+
+**Every command suddenly returns 401.** Atlassian API tokens expire after at
+most 365 days, and an expired token fails exactly like a wrong one. Before
+re-checking your config, check the age of the token at *id.atlassian.com ->
+Security -> API tokens*; if it is close to a year old, that is the answer. Issue
+a new one and run `lazyfish init --force --profile <name>` to replace that
+profile, or edit the `credentials` file directly.
+
+**"No credentials for profile X", but you are sure you wrote them.** The two
+files are joined by profile name and located together, so both halves are worth
+checking:
+
+```sh
+lazyfish status                 # validates config, no network
+lazyfish --config <path> status # the same question about an explicit location
+```
+
+`--config` and `$LAZYFISH_CONFIG` both name `config.toml`, and the credentials
+file is always read from that file's directory. Nothing is searched for: not the
+current directory, not a parent, not the repository.
+
+**A command exits 7 with "is not a SQLite database".** Almost always
+`LAZYFISH_DATA_DIR` pointing somewhere unintended rather than a damaged file.
+Check the variable first; if the path is right, move the file aside and lazyfish
+will create a new database. Only the recorded tickets are lost.
+
+**"Branch lazyfish/KEY is already checked out by profile X".** Two profiles
+matched the same ticket in the same repository. Worktrees are per profile,
+branches are not. Give one profile its own `branch_prefix`, or finish the ticket
+in the other profile first.
+
+**`git worktree` complains about a path that already exists.** lazyfish adopts
+its own worktrees and refuses to touch anything else in that directory. Move the
+foreign directory aside, or point `worktree_root` elsewhere.
 
 ## Credentials, data and privacy
 

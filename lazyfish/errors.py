@@ -40,3 +40,14 @@ class ValidationError(LazyfishError):
     """plan.json failed schema validation or one of the extra rules."""
 
     exit_code = 6
+
+
+class DatabaseError(LazyfishError):
+    """The local database could not be opened, read or written.
+
+    Distinct from StateError, which is about a transition the records forbid.
+    This one is about the file itself: missing, not a database, locked, or on a
+    directory that cannot be written to.
+    """
+
+    exit_code = 7

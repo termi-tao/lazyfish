@@ -341,6 +341,12 @@ RETIRED_PATTERNS = {
     "repo_profile": re.compile(r"repo_profile"),
     "--repo": re.compile(r"--repo\b"),
     "email_env / token_env": re.compile(r"email_env|token_env"),
+    # Added by LF-4. The patterns above are all identifiers, which is exactly
+    # why K4 survived them: the retired vocabulary also appears as a TOML table
+    # name in error messages and as an English phrase in prose, and neither
+    # shape has an underscore or a leading dash to match on.
+    "[tracker]": re.compile(r"\[tracker\]"),
+    "repo profile": re.compile(r"repo profile"),
 }
 
 

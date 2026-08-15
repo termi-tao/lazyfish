@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .artifacts import TYPE_REJECTION, Artifact, ensure_authorized
-from .errors import StateError
+from .errors import DatabaseError, StateError
 from .paths import db_path
 
 STATE_READY_FOR_PLAN = "READY_FOR_PLAN"
@@ -423,6 +423,62 @@ def check_transition(current: str, target: str) -> None:
         raise StateError(f"Cannot move a task from {current} to {target}. Legal targets: {legal}")
 
 
+def _as_database_error(path: Path, operation: str, exc: sqlite3.Error) -> DatabaseError:
+    """Turn a raw sqlite failure into something a person can act on.
+
+    The file path and the operation are both in the message because neither is
+    guessable from the outside: the database location is three environment
+    variables away from the command line, and "it failed" without saying at what
+    sends people looking at their config instead of their disk.
+    """
+    detail = str(exc)
+    if "file is not a database" in detail or "encrypted" in detail:
+        # By far the likeliest cause is a misdirected LAZYFISH_DATA_DIR rather
+        # than corruption, and the two need different reactions, so the message
+        # names the more probable one first.
+        return DatabaseError(
+            f"{path} is not a SQLite database.\n"
+            f"Most often that means LAZYFISH_DATA_DIR points somewhere unintended - "
+            f"check it before assuming the file is damaged.\n"
+            f"If the path is right, move the file aside and lazyfish will create a "
+            f"new database; the tickets it recorded are lost, nothing else is.\n"
+            f"({operation}: {detail})"
+        )
+    return DatabaseError(f"Database error in {path} while {operation}: {detail}")
+
+
+def _guard_sqlite(cls: type) -> type:
+    """Convert sqlite3.Error into DatabaseError on every method of the class.
+
+    One wrapper rather than a `try` in each of thirty methods, and, more to the
+    point, one that a method added later cannot forget. The alternative the
+    ticket rejected is a blanket `except Exception` in main(): that would also
+    swallow real bugs and print them as friendly advice, which is how a defect
+    becomes permanent.
+    """
+
+    def wrap(name: str, method):
+        def guarded(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs)
+            except sqlite3.Error as exc:
+                raise _as_database_error(self.path, name, exc) from exc
+
+        guarded.__name__ = method.__name__
+        guarded.__doc__ = method.__doc__
+        guarded.__qualname__ = method.__qualname__
+        return guarded
+
+    for name, attr in list(vars(cls).items()):
+        if not callable(attr):
+            continue
+        if name.startswith("__") and name != "__init__":
+            continue
+        setattr(cls, name, wrap(name, attr))
+    return cls
+
+
+@_guard_sqlite
 class Database:
     """Thin wrapper over a sqlite3 connection. Callers use the module helpers."""
 
@@ -452,11 +508,34 @@ class Database:
            index that already exists under the old key is not touched by a
            `CREATE ... IF NOT EXISTS` for a different one.
         """
+        self._refuse_a_newer_schema()
         with self.conn:
             self.conn.executescript(SCHEMA_SQL)
             self._add_missing_columns()
             self._rekey_live_ticket_index()
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _refuse_a_newer_schema(self) -> None:
+        """Stop if the file was written by a build that knows more than this one.
+
+        `user_version` was written from the first release and never read, which
+        made it a promise the code did not keep. It is read here, in the one
+        direction the migrations cannot cover: older files are handled by adding
+        what they lack, but a *newer* file may have columns and constraints this
+        build has never heard of, and writing to it is how data gets damaged.
+
+        This is reachable the moment lazyfish is installed on two machines that
+        share a data directory, or one machine whose install is behind.
+        """
+        stored = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if stored > SCHEMA_VERSION:
+            raise DatabaseError(
+                f"{self.path} was written by a newer lazyfish (database version "
+                f"{stored}; this build understands {SCHEMA_VERSION}).\n"
+                f"Upgrade lazyfish, or point LAZYFISH_DATA_DIR at a different "
+                f"directory. lazyfish will not write to a database it cannot "
+                f"fully read."
+            )
 
     def _rekey_live_ticket_index(self) -> None:
         """Replace the WIP index with the per-ticket one (D9). Idempotent.

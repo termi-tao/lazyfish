@@ -34,8 +34,14 @@ def config_path() -> Path:
     return config_home() / CONFIG_FILENAME
 
 
-def credentials_path() -> Path:
+def credentials_path(config_file: Path | None = None) -> Path:
     """Full path to the credentials file, always beside config.toml.
+
+    `config_file` names a config.toml explicitly, and the credentials file is
+    taken from its directory. That is what makes `--config` and $LAZYFISH_CONFIG
+    the same instruction: the environment variable already relocates both files
+    together, because `config_home()` reads it. Without the argument the
+    behaviour is unchanged.
 
     Deliberately not searched for: never the current directory, never an
     ancestor, never the target repository. lazyfish creates git worktrees, and a
@@ -43,6 +49,8 @@ def credentials_path() -> Path:
     scheme that reads configuration out of a repository is broken there by
     construction.
     """
+    if config_file is not None:
+        return Path(config_file).expanduser().parent / CREDENTIALS_FILENAME
     return config_home() / CREDENTIALS_FILENAME
 
 
@@ -62,5 +70,5 @@ def db_path() -> Path:
 
 
 def default_worktree_root() -> Path:
-    """Where worktrees go when a repo profile does not say otherwise."""
+    """Where worktrees go when a profile does not say otherwise."""
     return data_home() / "worktrees"

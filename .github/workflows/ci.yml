@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # The repository's default branch is master. This said `main` from the
+    # first commit, so every direct push to the public repository ran no
+    # checks at all.
+    branches: [master]
   pull_request:
 
 jobs:

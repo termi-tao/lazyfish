@@ -42,10 +42,19 @@ than a promise: a tool that starts no AI process cannot select an account.
 If you think a feature needs a model call, it belongs in a different tool that
 consumes lazyfish's output.
 
+## What `LF-2 D7` in a comment means
+
+Comments and docstrings cite decisions as `LF-<n> D<m>` — ticket number, then
+the numbered decision inside that ticket's design document. These are this
+project's own design notes, not links into a public tracker, and they are not
+distributed with the package. You will not find them in a clone, and you do not
+need them to read the code: the comment always states the reasoning, and the
+reference only says where it was first argued.
+
 ## Development setup
 
 ```sh
-git clone https://github.com/lazyfish-dev/lazyfish
+git clone https://github.com/termi-tao/lazyfish
 cd lazyfish
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"

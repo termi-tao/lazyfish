@@ -242,7 +242,7 @@ class JiraCloudClient:
         except httpx.HTTPError as exc:
             raise TrackerError(
                 f"Cannot reach the tracker at {self.base_url}: {exc}\n"
-                f"Check [tracker] base_url and your network connection."
+                f"Check base_url in [profile.<name>] and your network connection."
             ) from exc
         return response
 
@@ -325,7 +325,7 @@ class JiraCloudClient:
         if response.status_code == 400:
             raise TrackerError(
                 "The tracker rejected the configured query (HTTP 400).\n"
-                "Check the [tracker] query value in your config; status names and "
+                "Check the query value in [profile.<name>]; status names and "
                 "project keys are instance-specific." + self._error_detail(response)
             )
 

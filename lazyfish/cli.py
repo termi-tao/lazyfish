@@ -45,6 +45,7 @@ from .config import (
     DEFAULT_TIMEOUT_SECONDS,
     PROFILE_ENV,
     Config,
+    Credentials,
     Profile,
     load_config,
     resolve_credentials,
@@ -139,6 +140,11 @@ def _config(ctx: click.Context) -> Config:
 def _profile(ctx: click.Context, config: Config) -> Profile:
     """--profile, then $LAZYFISH_PROFILE, then default_profile."""
     return config.select(ctx.obj.get("profile"))
+
+
+def _credentials(ctx: click.Context, profile: Profile) -> Credentials:
+    """Credentials for one profile, from the file the group layer settled on."""
+    return resolve_credentials(profile.name, ctx.obj.get("credentials_path"))
 
 
 def _database(ctx: click.Context) -> Database:
@@ -397,6 +403,11 @@ def cli(ctx: click.Context, profile: str | None, config_file: Path | None) -> No
     ctx.ensure_object(dict)
     ctx.obj["profile"] = profile
     ctx.obj["config_path"] = config_file
+    # Both files are located once, here, so that every reader below agrees on
+    # where they are. --config used to move config.toml without moving the
+    # credentials beside it: init wrote the token to one directory and the next
+    # command looked in another.
+    ctx.obj["credentials_path"] = credentials_path(config_file)
 
 
 # --------------------------------------------------------------------------- #
@@ -517,7 +528,7 @@ def init(
     everything already in the files untouched.
     """
     config_target = ctx.obj.get("config_path") or config_path()
-    credentials_target = config_target.parent / credentials_path().name
+    credentials_target = ctx.obj.get("credentials_path") or credentials_path()
 
     interactive = not yes
     if interactive:
@@ -699,7 +710,7 @@ def _connectivity_check(ctx: click.Context, profile_name: str) -> None:
     try:
         config = _config(ctx)
         profile = config.select(profile_name)
-        client = build_client(profile, resolve_credentials(profile.name))
+        client = build_client(profile, _credentials(ctx, profile))
     except LazyfishError as exc:
         warn(f"connectivity check skipped: {exc}")
         return
@@ -778,7 +789,7 @@ def list_tickets(ctx: click.Context, limit: int, as_json: bool) -> None:
     # touches the checkout, and having a ticket in flight is exactly when you
     # most want to see what else is queued (R3, AC9).
 
-    client = build_client(profile, resolve_credentials(profile.name))
+    client = build_client(profile, _credentials(ctx, profile))
     try:
         tickets = client.list_candidates(limit=limit)
     finally:
@@ -885,7 +896,7 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
         elif live:
             raise _ambiguous(profile, live)
 
-        client = build_client(profile, resolve_credentials(profile.name))
+        client = build_client(profile, _credentials(ctx, profile))
         try:
             candidates = client.list_candidates(limit=limit)
             if ticket_key:
@@ -894,7 +905,7 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
                 if not candidates:
                     raise LazyfishError(
                         "The tracker query matched no tickets.\n"
-                        "Check the [tracker] query in your config, or pass "
+                        f"Check the query in [profile.{profile.name}], or pass "
                         "--ticket <KEY> to prepare a specific one."
                     )
                 ticket_key = candidates[0].key
@@ -904,6 +915,7 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
             note(f"Fetching {ticket_key} ...")
             ticket = client.fetch(ticket_key)
 
+            _refuse_branch_collision(config, profile, ticket.key)
             worktree = create_worktree(profile, ticket.key)
             write_ticket_json(worktree, ticket)
 
@@ -950,6 +962,63 @@ def prep(ctx: click.Context, ticket_key: str | None, limit: int, no_hints: bool)
 
     missing = conventions_path if conventions_text is None else None
     out(_prepared_block(profile, task, missing))
+
+
+def _branch_holder(repo: Path, branch: str) -> Path | None:
+    """The worktree that currently has `branch` checked out, if any."""
+    listing = run_git(repo, "worktree", "list", "--porcelain", check=False)
+    if listing.returncode != 0:
+        return None
+    path: Path | None = None
+    for line in listing.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree ") :])
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+def _refuse_branch_collision(config: Config, profile: Profile, ticket_key: str) -> None:
+    """Say why two profiles cannot prepare the same ticket in the same repository.
+
+    Worktrees are namespaced by profile and branches are not, so two profiles
+    whose queries both match one ticket in one repository ask git for a branch
+    that is already checked out somewhere else. Git's own refusal is accurate and
+    unhelpful -- it names a path under a directory the person has probably never
+    looked at, and says nothing about profiles or about the key that fixes it.
+
+    The default branch name is deliberately left alone (D3): the collision needs
+    one ticket, two profiles and one repository at once, and lengthening every
+    branch name for everyone is the wrong trade. What was missing was not a
+    different name, it was an explanation.
+    """
+    branch = profile.branch_name(ticket_key)
+    holder = _branch_holder(profile.repo, branch)
+    if holder is None:
+        return
+    mine = ticket_root(profile, ticket_key)
+    if holder == mine or mine in holder.parents:
+        return
+
+    # A plain loop, not next(): this module defines a command named `next`, which
+    # shadows the builtin for the whole file.
+    owner = str(holder)
+    for name, candidate in config.profiles.items():
+        if name == profile.name or candidate.repo is None:
+            continue
+        if holder.is_relative_to(candidate.worktree_path(ticket_key)):
+            owner = f"profile '{name}'"
+            break
+    raise WorkspaceError(
+        f"Branch {branch} is already checked out by {owner}, so profile "
+        f"'{profile.name}' cannot prepare {ticket_key} in the same repository.\n"
+        f"Worktrees are kept per profile but branch names are not, and both "
+        f"profiles build {branch} for this ticket.\n"
+        f"Give one of them its own namespace, for example:\n"
+        f"    [profile.{profile.name}]\n"
+        f'    branch_prefix = "lazyfish/{profile.name}/"\n'
+        f"Or finish the ticket in the other profile first."
+    )
 
 
 def _handle_active(profile: Profile, active: Task) -> None:
