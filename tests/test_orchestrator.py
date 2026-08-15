@@ -88,8 +88,8 @@ def a_task(database: Database, *, state: str = STATE_READY_FOR_PLAN, **columns: 
         ticket_title="Password reset links expire too early",
         profile="work",
         branch="lazyfish/PROJ-1",
-        worktree_path="/tmp/worktrees/work/PROJ-1",
-        artifacts_path="/tmp/worktrees/work/PROJ-1/artifacts/PROJ-1",
+        worktree_path="/tmp/worktrees/work/PROJ-1/architect",
+        artifacts_path="/tmp/worktrees/work/PROJ-1/architect/artifacts/PROJ-1",
         was_top_pick=True,
         base_commit="0" * 40,
     )
@@ -380,7 +380,7 @@ def test_next_step_on_a_prepared_task_names_the_stage_and_the_workspace(
 ) -> None:
     step = next_step(a_task(database))
     assert step.stage == STAGE_ARCHITECT
-    assert step.workspace == "/tmp/worktrees/work/PROJ-1"
+    assert step.workspace == "/tmp/worktrees/work/PROJ-1/architect"
     assert step.state == STATE_READY_FOR_PLAN
     assert step.blocked_on is None
 

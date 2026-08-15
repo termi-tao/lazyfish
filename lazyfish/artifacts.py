@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import ValidationError, WorkspaceError
+from . import authority
+from .errors import LazyfishError, ValidationError, WorkspaceError
 from .schema import PlanIssue, validate_plan
 from .workspace import PLAN_FILENAME, STATE_DIRNAME
 
@@ -34,21 +35,29 @@ from .workspace import PLAN_FILENAME, STATE_DIRNAME
 # Vocabulary
 # --------------------------------------------------------------------------- #
 
-TYPE_TECHNICAL_PLAN = "TechnicalPlan"
-"""The Architect's artifact. The only contract registered this slice."""
+TYPE_TECHNICAL_PLAN = authority.TYPE_TECHNICAL_PLAN
+ROLE_ARCHITECT = authority.ROLE_ARCHITECT
+"""Re-exported from the authority table, which is where they are defined.
+
+Spelled here as aliases rather than as a second pair of string literals: the
+authority table decides whether a call site may produce a `TechnicalPlan` by
+comparing this exact string, so two independent definitions would fail closed
+and be tedious to find the day one of them was edited. That is the drift
+`authority.py`'s own docstring warns about, and having written the warning it
+would be poor form to be the first to ignore it. The names stay importable from
+here because that is where callers have always found them."""
 
 TYPE_REJECTION = "Rejection"
 """A rejection is stored like any other artifact so that a retry loop leaves a
-record, but it is not a contract: nobody extracts one from a workspace."""
+record, but it is not a contract: nobody extracts one from a workspace. Defined
+here and not in the authority table on purpose -- no call site produces one, so
+the table has nothing to say about it."""
 
-ROLE_ARCHITECT = "architect"
 ROLE_ORCHESTRATOR = "orchestrator"
-"""Producer names. The other three agent roles arrive with their stages.
-
-The Orchestrator is listed because it produces one artifact type of its own, a
-rejection. That is not the same as being an agent (A-4): it produces a record of
-its own deterministic judgement, and it is the only party that may promote
-anything at all."""
+"""The Orchestrator produces one artifact type of its own, a rejection. That is
+not the same as being an agent (A-4): it produces a record of its own
+deterministic judgement, and it is the only party that may promote anything at
+all. The four agent roles live in the authority table."""
 
 PROMOTER_ORCHESTRATOR = "orchestrator"
 PROMOTER_HUMAN = "human"
@@ -103,6 +112,12 @@ class Artifact:
     because HEAD and refs are writable by the party being checked (D4).
     `parents` answers "which version of the input was this made against", which
     is the only way to tell, after a retry, which artifact a report judged.
+
+    `call_site` is the point in the pipeline that produced it, which `produced_by`
+    cannot express: a Tester writing tests and a Tester verifying an
+    implementation are the same role at two call sites, and they are authorised
+    to produce different things. NULL on rows written before LF-6; authority
+    falls back to the weaker role-level question for those (`ensure_authorized`).
     """
 
     id: str
@@ -110,6 +125,7 @@ class Artifact:
     produced_by: str
     task_id: int
     base_commit: str | None
+    call_site: str | None = None
     parents: tuple[str, ...] = ()
     promoted_at: str | None = None
     attempt: int = 0
@@ -121,6 +137,7 @@ class Artifact:
             "id": self.id,
             "type": self.type,
             "produced_by": self.produced_by,
+            "call_site": self.call_site,
             "task_id": self.task_id,
             "base_commit": self.base_commit,
             "parents": list(self.parents),
@@ -200,7 +217,91 @@ Deliberately one entry. Bringing four unverified contracts up at once was
 rejected (A-3): when something misbehaves there would be no way to tell which
 one. This is a registry, not a configurable abstraction layer -- adding the next
 stage means adding an entry, not designing a schema for contracts.
+
+LF-6 defines the other three contracts and this slice does not register them.
+Nothing extracts or validates an artifact at a call site that cannot yet run, so
+a registered entry would be a surface with no entry point -- the same thing LF-6
+refused for states, for the same reason. What materialisation genuinely needs
+from those contracts is one bit, whether the type carries a patch, and that is
+`PATCH_CARRYING_TYPES` below. The registration belongs with the stage that first
+calls it. (Reported: LF-6's `changes` asks for registration now, while its AC7
+forbids turning an existing test red, and
+`test_only_the_technical_plan_contract_is_registered` pins this set. AC7 wins
+until the plan says otherwise.)
 """
+
+
+# --------------------------------------------------------------------------- #
+# Authority
+# --------------------------------------------------------------------------- #
+
+PATCH_CARRYING_TYPES: frozenset[str] = frozenset(
+    {authority.TYPE_TEST_ARTIFACT, authority.TYPE_IMPLEMENTATION_PATCH}
+)
+"""Artifact types whose content includes a `patch` to be applied on top of the
+base commit. Everything else is data: it travels as context and changes no file.
+
+One rule covering every contract rather than a flag per contract, because
+materialisation only needs to ask one question of an artifact. The patch is a
+unified diff and never a commit: a commit would mean trusting refs inside a
+workspace the party being checked can write.
+"""
+
+PATCH_FIELD = "patch"
+
+
+def carries_patch(artifact_type: str) -> bool:
+    """Whether materialisation applies this type's content to the workspace."""
+    return artifact_type in PATCH_CARRYING_TYPES
+
+
+def ensure_authorized(artifact: Artifact) -> None:
+    """Refuse a promotion the authority table does not permit (AC2, AC3).
+
+    Called by `promote`, which is the only place authority can be enforced
+    without trusting anyone: an agent may write whatever it likes in its own
+    workspace, and the question is only ever which of that becomes the version
+    downstream is built from.
+
+    A type outside the table is deliberately left alone, because a Rejection is
+    the Orchestrator's own record of its own judgement and no call site produces
+    one.
+
+    A row with no `call_site` is the pre-LF-6 shape, and it is answered only when
+    the role leaves no room for a question: exactly one call site. That is not a
+    narrowing of the fallback's purpose, it is its purpose stated precisely --
+    every artifact a pre-LF-6 database can hold is an architect's TechnicalPlan,
+    and the architect has one call site, so nothing that fallback exists for is
+    turned away. Asking the looser question instead ("may this *role* produce
+    this type anywhere?") would make a missing call site into a way around the
+    table for exactly the roles the table was reshaped to split: with two call
+    sites, a NULL would let either one's output through as the other's.
+    """
+    if artifact.type not in authority.GOVERNED_TYPES:
+        return
+    if artifact.call_site is None:
+        sites = authority.call_sites_for(artifact.produced_by)
+        if len(sites) == 1 and authority.may_produce(sites[0], artifact.type):
+            return
+        if len(sites) == 1:
+            raise LazyfishError(
+                f"{sites[0]} is not authorized to produce a {artifact.type}, and "
+                f"that is the only call site the {artifact.produced_by} role has."
+            )
+        raise LazyfishError(
+            f"This {artifact.type} records no call site, so it cannot be judged: "
+            f"the {artifact.produced_by} role runs at {len(sites)} call sites and "
+            f"they are not authorized to produce the same things. Record the call "
+            f"site that produced it."
+        )
+    if authority.may_produce(artifact.call_site, artifact.type):
+        return
+    site = authority.CALL_SITES.get(artifact.call_site)
+    permitted = ", ".join(site.produces) if site else "nothing (no such call site)"
+    raise LazyfishError(
+        f"{artifact.call_site} is not authorized to produce a {artifact.type}. "
+        f"That call site may produce: {permitted}."
+    )
 
 
 # --------------------------------------------------------------------------- #

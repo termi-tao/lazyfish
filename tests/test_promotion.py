@@ -673,26 +673,26 @@ def test_show_still_works_while_a_plan_waits_for_approval(
     assert "PROJ-1" in result.stdout
 
 
-def test_prep_does_not_start_a_second_ticket_while_one_waits(
+def test_bare_prep_reprints_one_waiting_ticket_but_an_explicit_ticket_opens_another(
     prepared_worktree: tuple[dict[str, Path], Path, FakeTracker], runner: CliRunner
 ) -> None:
-    """The WIP rule keeps its meaning across the new states.
-
-    Before this slice the window between prep and accept was a single state; now
-    it is three. A profile must still hold one ticket at a time throughout.
-    """
+    """LF-6 D10: only an explicit ticket request opens concurrent work."""
     env, worktree, tracker = prepared_worktree
     write_plan(worktree)
     assert runner.invoke(cli, ["promote"]).exit_code == 0
 
     tracker.tickets = [make_ticket("PROJ-2")]
-    result = runner.invoke(cli, ["prep"])
+    repeated = runner.invoke(cli, ["prep"])
     assert len(tasks_of(env)) == 1
-    assert "PROJ-1" in result.stdout + result.stderr
+    assert "PROJ-1" in repeated.stdout + repeated.stderr
     assert not (worktree.parent / "PROJ-2").exists()
 
+    result = runner.invoke(cli, ["prep", "--ticket", "PROJ-2"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert [task.ticket_key for task in tasks_of(env)] == ["PROJ-1", "PROJ-2"]
 
-def test_prep_does_not_start_a_second_ticket_after_a_rejection(
+
+def test_an_explicit_ticket_opens_after_a_rejection_without_abandoning_the_first(
     prepared_worktree: tuple[dict[str, Path], Path, FakeTracker], runner: CliRunner
 ) -> None:
     env, worktree, tracker = prepared_worktree
@@ -700,8 +700,9 @@ def test_prep_does_not_start_a_second_ticket_after_a_rejection(
     assert runner.invoke(cli, ["promote"]).exit_code == 6
 
     tracker.tickets = [make_ticket("PROJ-2")]
-    runner.invoke(cli, ["prep"])
-    assert len(tasks_of(env)) == 1
+    result = runner.invoke(cli, ["prep", "--ticket", "PROJ-2"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert [task.ticket_key for task in tasks_of(env)] == ["PROJ-1", "PROJ-2"]
 
 
 # --------------------------------------------------------------------------- #
