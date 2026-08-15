@@ -26,31 +26,48 @@ question.
 lazyfish prep      tracker -> git worktree + context files -> local database
       |
       v
-  (you: cd into the worktree and run whatever design tool you use)
+  (you: cd into the workspace and run whatever AI tool you use)
       |
       v
-lazyfish promote   check the plan against its contract, keep it as an artifact
+lazyfish promote   check that stage's artifact against its contract, keep it
       |
       v
 lazyfish show      read the plan, highlight what still needs deciding
 lazyfish accept    record your decision: as-is, modified, or turned down
+      |
+      v
+  design stage ends, tests stage begins -- a fresh workspace from the baseline
+      |
+      v
+  (you: write the tests)  ->  lazyfish promote  ->  done
 ```
 
-`accept` promotes for you, so the short version is still `prep`, design, `accept`.
+`accept` promotes for you, so the design stage is still `prep`, design, `accept`.
+`lazyfish next` tells you where a ticket is and what it is waiting for.
 
-## Only the plan leaves the worktree
+## Only the artifact leaves the workspace
 
-The worktree is yours to do anything in. Nothing is locked, and nothing is
-policed. What lazyfish keeps when the design stage ends is **the plan file, and
-nothing else** — recorded as an artifact, identified by a hash of its content,
-alongside the commit it was written against.
+Each stage gets its own directory and it is yours to do anything in. Nothing is
+locked, and nothing is policed. What lazyfish keeps when a stage ends is **what
+that stage's contract names, and nothing else** — recorded as an artifact,
+identified by a hash of its content, alongside the commit it was written
+against. For the design stage that is the plan file; for the tests stage it is
+the tests, as a patch, with the coverage table that declares them.
 
 That has a consequence worth being explicit about: if the design stage also
 writes the implementation, those changes are not a violation and will not fail
-anything. They simply do not travel. No later step starts from that directory.
+anything. They simply do not travel — no later stage starts from that directory,
+each one is built fresh from the baseline plus the artifacts it is entitled to
+read.
 
-The worktree is not deleted — you can look through it, and `prep` will adopt it
-again — but after promotion its contents carry no authority.
+The reverse is worth being just as explicit about. A stage whose artifact *is* a
+patch carries everything it changed, so a stage that edits beyond its remit
+hands those edits downstream. Nothing currently stops that; the check is the
+file list `promote` prints and your reading of it.
+
+Workspaces are not deleted — you can look through any stage's afterwards, and
+`prep` will adopt the design one again — but after promotion their contents
+carry no authority.
 
 What lazyfish does do is **count** what it found there. Promoting reports how many
 files and lines changed beyond the plan, and records both against the ticket, so
@@ -181,9 +198,10 @@ lazyfish prep                     # falls back to default_profile
 ```
 
 `--profile` beats `LAZYFISH_PROFILE`, which beats `default_profile`. Each profile
-keeps its own in-flight ticket and its own statistics: **one ticket per profile
-at a time**, not one overall. Two profiles means two tickets can be awaiting a
-plan simultaneously.
+keeps its own tickets and its own statistics. Several tickets may be in flight in
+one profile at once; what a profile may not hold is two live copies of the same
+ticket. When more than one is in flight, commands ask for `--ticket <KEY>`
+instead of guessing.
 
 ### Defaults and overrides
 
@@ -366,9 +384,64 @@ $ lazyfish accept
 Accept the plan for PROJ-412 exactly as written? [Y/n]: n
 What did you change, or what was missing?: missed the rate limiter on the reset endpoint
 Recorded PROJ-412 as accepted with changes.
+Prepared the tester@write workspace at ~/.local/share/lazyfish/worktrees/work/PROJ-412/tester@write
 ```
 
-That answer is the point of the whole exercise. Over a few weeks:
+That answer is the point of the whole exercise.
+
+### Then the tests
+
+Approving the plan ends the design stage, not the ticket. The next stage has its
+own workspace, built from the **baseline commit** — not from the directory you
+just designed in:
+
+```sh
+$ lazyfish next
+Next stage: tester@write
+  ticket            PROJ-412
+  workspace         ~/.local/share/lazyfish/worktrees/work/PROJ-412/tester@write
+
+$ cd ~/.local/share/lazyfish/worktrees/work/PROJ-412/tester@write
+```
+
+That directory holds the ticket, the approved acceptance criteria numbered
+`AC1`…`ACn`, and a brief. Write the tests, plus a table saying which criterion
+each one covers:
+
+```json
+{
+  "coverage": [
+    {"ac_id": "AC1", "test_ids": ["tests/test_reset.py::test_link_expires_after_a_day"]},
+    {"ac_id": "AC2", "test_ids": ["tests/test_reset.py::test_an_expired_link_is_refused"]}
+  ]
+}
+```
+
+Then promote. Nobody approves this stage, so passing its contract is the whole
+event:
+
+```sh
+$ lazyfish promote
+TestArtifact carries 1 file(s):
+    tests/test_reset.py
+Promoted the TestArtifact for PROJ-412.
+  state             completed
+
+That was the last stage. Nothing further is waiting on PROJ-412.
+```
+
+**Expect those tests to fail.** They are written before the implementation on
+purpose: tests written against code that already passes describe it instead of
+constraining it. That is also why this workspace is built from the baseline and
+not from the design stage's copy.
+
+Four things are checked, and none of them runs your tests: the patch is not
+empty, every `ac_id` is a criterion of the approved plan, every criterion has at
+least one test, and every declared test lives in a file the work actually
+touched. Whether a test really exercises the criterion it claims is a judgement,
+and no rule here pretends to make it.
+
+Over a few weeks:
 
 ```sh
 $ lazyfish status
@@ -391,14 +464,16 @@ and the branch and frees the profile for the next one.
 | `lazyfish list` | Show the tickets your query matches. Read-only, no side effects. |
 | `lazyfish prep` | Choose a ticket, create the worktree, write the context files. Idempotent. |
 | `lazyfish next` | Say what the next step is and where to take it. `--json`. |
-| `lazyfish promote` | Check the plan against its contract and keep it, or reject it. `--json`. |
+| `lazyfish promote` | Check the current stage's artifact against its contract and keep it, or reject it. `--json`. |
 | `lazyfish show` | Print the current plan and highlight open questions. |
-| `lazyfish accept` | Promote, then record your decision: `--as-is`, `--modified` or `--reject`. |
+| `lazyfish accept` | Promote, then record your decision: `--as-is`, `--modified` or `--reject`. Only at stages a person approves. |
 | `lazyfish abandon` | Drop the ticket in flight, delete its worktree and branch. |
 | `lazyfish status` | Acceptance rates, rejections, escalations and cycle time, per profile. |
 
-`--profile <name>` is available on all of them. One ticket per profile is in
-flight at a time, from `prep` until you have made a decision about the plan.
+`--profile <name>` is available on all of them. A ticket is in flight from `prep`
+until its last stage completes, which is now later than the plan's approval; a
+profile may hold several at once, and commands ask for `--ticket <KEY>` rather
+than guess between them.
 
 `next` and `promote` both speak JSON so that a driver can advance one stage
 without reading anything meant for a person. They are the only two commands a

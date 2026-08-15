@@ -24,9 +24,10 @@ from pathlib import Path
 import click
 import tomlkit
 
-from . import __version__
+from . import __version__, authority
 from .artifacts import (
     CONTRACTS,
+    PATCH_FIELD_FILES,
     PROMOTER_HUMAN,
     PROMOTER_ORCHESTRATOR,
     ROLE_ORCHESTRATOR,
@@ -34,6 +35,8 @@ from .artifacts import (
     TYPE_TECHNICAL_PLAN,
     Artifact,
     ArtifactStore,
+    Contract,
+    acceptance_criteria_of,
     content_id,
 )
 from .authority import CALL_SITE_ARCHITECT
@@ -66,9 +69,11 @@ from .orchestrator import (
     advance_stage,
     decide_promotion,
     ensure_promotable,
+    is_finished,
     next_step,
     requires_approval,
     state_label,
+    workspace_for,
 )
 from .paths import config_path, credentials_path, data_home, db_path
 from .rejection import Finding, RejectionArtifact, from_human
@@ -87,6 +92,7 @@ from .workspace import (
     collect_hints,
     create_worktree,
     download_attachments,
+    materialize,
     measure_drift,
     plan_attachments,
     read_conventions,
@@ -164,6 +170,53 @@ def _worktree_of(task: Task) -> Worktree:
         artifacts_dir=Path(task.artifacts_path),
         created=False,
     )
+
+
+def _contract_for(call_site: str) -> Contract:
+    """The contract of whatever this call site is authorised to produce.
+
+    One lookup through the authority table rather than a name written at the
+    call site: which artifact a stage produces is already recorded there, and a
+    second copy of that fact is how the two come to disagree.
+    """
+    produced = authority.produces_for(call_site)
+    contract = CONTRACTS.get(produced[0]) if produced else None
+    if contract is None:
+        raise LazyfishError(
+            f"No contract is registered for what {call_site} produces, so nothing "
+            f"here can judge it. This is a gap in lazyfish, not in your work."
+        )
+    return contract
+
+
+def _workspace_of(task: Task, call_site: str) -> Worktree:
+    """The directory this call site works in.
+
+    The path comes from the Orchestrator so that a person reading `next` and a
+    command acting on the task are looking at the same directory. Two ways of
+    computing one path is how they come to differ.
+    """
+    if call_site == CALL_SITE_ARCHITECT:
+        return _worktree_of(task)
+    path = Path(workspace_for(task) or task.worktree_path)
+    return Worktree(
+        path=path,
+        branch=task.branch,
+        artifacts_dir=path / "artifacts" / task.ticket_key,
+        created=False,
+    )
+
+
+def _approved_criteria(database: Database, store: ArtifactStore, task: Task) -> list[str]:
+    """The acceptance criteria of this ticket's approved plan, if there is one.
+
+    Empty for the Architect itself, which is writing them. A contract that does
+    not need them ignores the keyword.
+    """
+    for artifact in reversed(database.list_artifacts(task.id)):
+        if artifact.type == TYPE_TECHNICAL_PLAN and artifact.promoted_at is not None:
+            return acceptance_criteria_of(store.load(task.id, artifact.id))
+    return []
 
 
 def _artifact_store() -> ArtifactStore:
@@ -1213,11 +1266,15 @@ def _decide(
     contract. It is deliberately not reachable from `promote`, only from `accept`,
     because anything driving the loop must not be able to skip the check (AC2).
     """
-    worktree = _worktree_of(task)
-    contract = CONTRACTS[TYPE_TECHNICAL_PLAN]
+    call_site = task.current_stage or CALL_SITE_ARCHITECT
+    worktree = _workspace_of(task, call_site)
+    contract = _contract_for(call_site)
     store = _artifact_store()
 
-    plan = contract.extract(worktree.path)
+    # Read before the state guard so that a repeat promotion of identical
+    # content is decidable, and before the attempt is charged so that a
+    # workspace with nothing in it does not spend budget.
+    plan = contract.extract(worktree.path, base_commit=task.base_commit)
     identifier = content_id(plan)
 
     # Promoting the same content again is a no-op, not a second promotion. The
@@ -1233,7 +1290,11 @@ def _decide(
     if derived:
         warn(f"no recorded baseline; derived {baseline[:12]} from merge-base.")
 
-    issues = contract.validate(plan, worktree.path)
+    issues = contract.validate(
+        plan,
+        worktree.path,
+        acceptance_criteria=_approved_criteria(database, store, task),
+    )
     task = database.count_attempt(task.id)
 
     # Measure what the stage did to the workspace, and record it (C1). This is
@@ -1241,21 +1302,30 @@ def _decide(
     # here on, so the count is taken now or not at all. It is an observation --
     # nothing below reads it, and a failed measurement is a warning, never a
     # refusal, because an observation that can veto is a gate in disguise.
-    drift = measure_drift(worktree.path, baseline)
-    if drift is None:
-        warn("could not measure how far the workspace drifted; recording it as unknown.")
-    database.record_drift(task.id, drift.files if drift else None, drift.lines if drift else None)
+    # Only where the artifact is smaller than the workspace. C1 measures "the
+    # design stage also wrote the implementation", which needs a stage whose
+    # output is a document and whose workspace is code. For a stage whose
+    # artifact *is* the workspace diff, the number would equal its own patch and
+    # mean nothing -- and the wording ("besides the plan") would be false.
+    drift = None
+    if requires_approval(call_site):
+        drift = measure_drift(worktree.path, baseline)
+        if drift is None:
+            warn("could not measure how far the workspace drifted; recording it as unknown.")
+        database.record_drift(
+            task.id, drift.files if drift else None, drift.lines if drift else None
+        )
     artifact = database.record_artifact(
         Artifact(
             id=identifier,
-            type=TYPE_TECHNICAL_PLAN,
+            type=contract.type,
             produced_by=contract.produced_by,
             # The authority table is keyed by call site, so the only path that
             # promotes anything has to fill it in. Left NULL, every artifact is
             # judged on its role instead -- which is the same answer only while
             # a role has one call site, and silently the wrong one from the
             # moment LF-7 gives the Tester two.
-            call_site=CALL_SITE_ARCHITECT,
+            call_site=call_site,
             task_id=task.id,
             base_commit=baseline,
             attempt=task.attempt,
@@ -1272,6 +1342,7 @@ def _decide(
         stage_attempts=task.attempt,
         ticket_attempts=task.ticket_attempts,
         previous_findings=_previous_findings(database, store, task.id),
+        call_site=call_site,
     )
 
     _report_drift(drift)
@@ -1280,15 +1351,41 @@ def _decide(
         promoter = PROMOTER_HUMAN if issues else PROMOTER_ORCHESTRATOR
         artifact = database.promote_artifact(task.id, identifier, promoted_by=promoter)
         database.set_state(task.id, decision.next_state)
+        # A stage with no human gate is finished the moment its artifact passes,
+        # so it advances here rather than waiting for an approval that is never
+        # going to be asked for. The Architect's gate is the exception, and it
+        # is the authority table that says so, not this branch (LF-7 D4).
+        state = decision.next_state
+        if not requires_approval(call_site):
+            state = _advance(ctx, database, task, call_site)
         # The bypass note is left to the caller: recording the approval rewrites
         # notes, so a note appended here would be overwritten a moment later.
-        return artifact, decision.next_state, bool(issues)
+        return artifact, state, bool(issues)
 
     assert decision.rejection is not None  # not promoted implies a rejection
     _store_rejection(database, store, task, decision.rejection, baseline=baseline)
     database.set_state(task.id, decision.next_state, escalation_reason=decision.escalation_reason)
     _report_rejection(decision, issues, worktree.plan_path)
     raise _Rejected(decision)
+
+
+def _advance(ctx: click.Context, database: Database, task: Task, call_site: str) -> str:
+    """Move a task to the next stage, building the workspace it will need.
+
+    Materialisation happens before the state is written, so that a workspace
+    that cannot be built leaves the task where it was rather than parked at a
+    stage whose directory does not exist (LF-8 D4).
+
+    Used by both routes into the next stage -- `promote` for a stage with no
+    human gate, `accept` for one that has it -- because the ordering matters
+    identically in both and one of the two would eventually get it wrong.
+    """
+    following, next_state = advance_stage(call_site)
+    if following is not None:
+        workspace = materialize(task, following)
+        note(f"Prepared the {following} workspace at {workspace.path}")
+    database.advance_to(task.id, stage=following, state=next_state)
+    return next_state
 
 
 def _report_drift(drift: Drift | None) -> None:
@@ -1326,15 +1423,16 @@ def _report_rejection(
 @click.option("--ticket", "ticket_key", default=None, help=TICKET_OPTION_HELP)
 @click.pass_context
 def promote(ctx: click.Context, as_json: bool, ticket_key: str | None) -> None:
-    """Validate the plan in the workspace and promote it, or reject it.
+    """Judge the current stage's artifact against its contract, and keep it or not.
 
     There is no flag here that skips validation. Promotion is the Orchestrator's
     authority (D2), and an escape hatch on this command would be reachable by
     anything driving the loop; the one that exists belongs to `accept`, where a
     person is present.
 
-    Promoting is not approving. A promoted plan is waiting for a human decision
-    and goes no further on its own (D10, AC13).
+    Promoting is not approving. A promoted plan waits for a human decision and
+    goes no further on its own (D10, AC13). A stage with no human gate has
+    nothing to wait for and moves on as soon as its artifact passes.
     """
     config = _config(ctx)
     profile = _profile(ctx, config)
@@ -1376,12 +1474,34 @@ def promote(ctx: click.Context, as_json: bool, ticket_key: str | None) -> None:
         )
         return
 
-    out(f"Promoted the plan for {task.ticket_key}.")
+    out(f"Promoted the {artifact.type} for {task.ticket_key}.")
     out(_field("artifact", artifact.id[:12]))
     out(_field("baseline", (artifact.base_commit or "-")[:12]))
     out(_field("state", state_label(state)))
+    _report_promoted_files(artifact, task)
     out("")
-    out("Read it with 'lazyfish show', then approve it with 'lazyfish accept'.")
+    if requires_approval(artifact.call_site):
+        out("Read it with 'lazyfish show', then approve it with 'lazyfish accept'.")
+    elif is_finished(state):
+        out(f"That was the last stage. Nothing further is waiting on {task.ticket_key}.")
+    else:
+        out("Run 'lazyfish next' to see where the ticket went.")
+
+
+def _report_promoted_files(artifact: Artifact, task: Task) -> None:
+    """List the files an artifact carries, when it carries files at all.
+
+    Printed because no stage's output is bounded by anything except what the
+    agent decided to write, and a person checking that a test artifact contains
+    only tests should not have to run `git diff` to find out (known-issues §7).
+    Reading a short list is the cheapest form that check can take.
+    """
+    files = _artifact_store().load(task.id, artifact.id).get(PATCH_FIELD_FILES)
+    if not isinstance(files, list) or not files:
+        return
+    note(f"{artifact.type} carries {len(files)} file(s):")
+    for name in files:
+        note(f"    {name}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1489,10 +1609,15 @@ def accept(
         notes = note_text
         if not accepted and notes is None:
             notes = _ask_for_a_note("What did you change, or what was missing?")
-        # One answer, two columns: the stage moves and `attempt` is cleared
-        # together, because a stage that starts with the previous one's spent
-        # budget escalates before it has run (LF-7 D5).
+        # One answer, three effects: the stage moves, `attempt` is cleared, and
+        # the next stage's workspace is built. The first two are one statement
+        # (LF-7 D5); the third happens *before* it, so that a workspace that
+        # cannot be built leaves the approval unwritten rather than leaving the
+        # ticket approved and parked at a stage it has already finished.
         following, next_state = advance_stage(task.current_stage)
+        if following is not None:
+            workspace = materialize(task, following)
+            note(f"Prepared the {following} workspace at {workspace.path}")
         task = database.mark_accepted(
             task.id,
             plan_accepted=accepted,

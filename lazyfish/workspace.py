@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -304,12 +305,121 @@ def materialize(task: Any, call_site: str) -> Workspace:
         _apply_patch(target, patch, artifact.id)
         applied.append(artifact.id)
 
+    _write_context_inputs(task, call_site, target, consumes, database_path=db_path())
+
     return Workspace(
         path=target,
         call_site=call_site,
         base_commit=task.base_commit,
         applied=tuple(applied),
     )
+
+
+class _TicketStub:
+    """What a stage brief needs of a ticket: its key.
+
+    A materialised workspace is built from the database, and the full Ticket
+    lives in the tracker's response, which is not re-fetched. The briefs written
+    here are told what they can be told.
+    """
+
+    def __init__(self, key: str):
+        self.key = key
+
+
+def _ticket_stub(task: Any) -> _TicketStub:
+    return _TicketStub(task.ticket_key)
+
+
+def _profile_of(task: Any):
+    from .config import load_config
+
+    return load_config().select(task.profile)
+
+
+def _write_context_inputs(
+    task: Any, call_site: str, target: Path, consumes: tuple[str, ...], *, database_path: Path
+) -> None:
+    """Write the inputs that are read but never promoted (LF-6, implemented in LF-8).
+
+    The authority table has listed these beside the artifact types since LF-6,
+    with a note saying they reach a workspace as context files rather than as a
+    patch. This is that note becoming code.
+
+    The distinction is not cosmetic. `acceptance_criteria` is *extracted from*
+    the approved plan, and what the Tester gets is the criteria alone -- not the
+    plan, not its reasoning, not its list of files to change. A stage that
+    consumes an artifact is built from that artifact; a stage that consumes a
+    pseudo-input is handed a fact taken out of one.
+    """
+    from .artifacts import (
+        COVERAGE_FILENAME,
+        TYPE_TECHNICAL_PLAN,
+        ArtifactStore,
+        ac_id_for,
+        acceptance_criteria_of,
+    )
+    from .db import Database
+    from .paths import data_home
+
+    state_dir = target / STATE_DIRNAME
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    if authority.INPUT_TICKET in consumes:
+        # Copied from the ticket's first workspace rather than re-rendered: it is
+        # a file lazyfish wrote, not something an agent produced, so the copy is
+        # the same bytes the design stage was given. Re-rendering would mean
+        # running the code search again and handing this stage a different
+        # context for the same ticket.
+        source = ticket_root(_profile_of(task), task.ticket_key) / authority.CALL_SITE_ARCHITECT
+        original = source / CONTEXT_FILENAME
+        if original.exists() and original.resolve() != (target / CONTEXT_FILENAME).resolve():
+            shutil.copyfile(original, target / CONTEXT_FILENAME)
+
+    if authority.INPUT_ACCEPTANCE_CRITERIA in consumes:
+        database = Database(database_path)
+        try:
+            promoted = [
+                artifact
+                for artifact in database.list_artifacts(task.id)
+                if artifact.type == TYPE_TECHNICAL_PLAN and artifact.promoted_at is not None
+            ]
+        finally:
+            database.close()
+        # No approved plan is not a reason to refuse a workspace. The criteria
+        # are context, and context that can veto is a gate in disguise (C1's
+        # rule, applied here). The gate that matters is in the contract: with no
+        # criteria, every `ac_id` a coverage table declares is out of range and
+        # the promotion fails there, which is the layer that should be saying no.
+        criteria: list[str] = []
+        if promoted:
+            store = ArtifactStore(data_home() / "artifacts")
+            criteria = acceptance_criteria_of(store.load(task.id, promoted[-1].id))
+
+        lines = [
+            f"# Acceptance criteria for {task.ticket_key}",
+            "",
+            "From the approved plan. The numbering is what "
+            f"`{STATE_DIRNAME}/{COVERAGE_FILENAME}` refers to.",
+            "",
+        ]
+        lines += [f"- **{ac_id_for(index)}** — {text}" for index, text in enumerate(criteria)]
+        if not criteria:
+            lines.append("_No approved plan carries acceptance criteria for this ticket._")
+        (state_dir / ACCEPTANCE_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    template = STAGE_BRIEFS.get(call_site)
+    if template is not None:
+        brief = (
+            _environment()
+            .get_template(template)
+            .render(
+                ticket=_ticket_stub(task),
+                acceptance_path=f"{STATE_DIRNAME}/{ACCEPTANCE_FILENAME}",
+                coverage_path=f"{STATE_DIRNAME}/{COVERAGE_FILENAME}",
+            )
+        )
+        (state_dir / template.removesuffix(".j2")).write_text(brief, encoding="utf-8")
 
 
 def _promoted_inputs(artifacts: list[Any], consumes: tuple[str, ...]) -> list[Any]:
@@ -396,6 +506,70 @@ class Drift:
 # agent's. Taken from the constants above so that renaming an output file keeps
 # the exclusion correct.
 TOOL_WRITTEN_PATHS = (STATE_DIRNAME, CONTEXT_FILENAME, ARTIFACTS_DIRNAME)
+
+ACCEPTANCE_FILENAME = "acceptance.md"
+
+STAGE_BRIEFS = {
+    authority.CALL_SITE_TESTER_WRITE: "tests-prompt.md.j2",
+}
+"""The brief each stage's workspace gets, where it has one.
+
+The Architect's is written by `render_context` at prep, because its workspace is
+built by `create_worktree` rather than materialised. Every later stage's is
+written here. Two paths for the same idea is a wart worth naming; merging them
+waits until a second materialised stage makes the shared shape visible.
+"""
+
+
+def diff_since(
+    workspace_path: Path, base_commit: str, exclude: Sequence[str] = TOOL_WRITTEN_PATHS
+) -> tuple[str, list[str]]:
+    """One stage's work as a unified diff against the baseline, and the files in it.
+
+    The same temporary-index technique `measure_drift` uses, and for the same two
+    reasons: the repository's own index is never touched, and staging everything
+    first is what makes newly created files appear at all. New test files are
+    untracked by definition, so a plain `git diff` would return an empty patch
+    for a workspace full of tests -- and the promotion would fail with
+    "unchanged" rather than with anything true.
+
+    Unlike `measure_drift`, a failure here raises. That one is an observation and
+    an observation must never veto; this one produces the artifact, and an
+    artifact that could not be built is not a smaller artifact.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        excludes = [f":(exclude){path}" for path in exclude]
+
+        staged = subprocess.run(
+            ["git", "-C", str(workspace_path), "add", "-A", "--", ".", *excludes],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if staged.returncode != 0:
+            raise WorkspaceError(
+                f"Could not stage the workspace at {workspace_path} to build a patch:\n"
+                f"{(staged.stderr or staged.stdout).strip()}"
+            )
+
+        def run(*args: str) -> subprocess.CompletedProcess:
+            result = subprocess.run(
+                ["git", "-C", str(workspace_path), *args],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            if result.returncode != 0:
+                raise WorkspaceError(
+                    f"git {' '.join(args)} failed in {workspace_path}:\n"
+                    f"{(result.stderr or result.stdout).strip()}"
+                )
+            return result
+
+        patch = run("diff", "--cached", "--binary", base_commit).stdout
+        names = run("diff", "--cached", "--name-only", base_commit).stdout
+    return patch, [line for line in names.splitlines() if line.strip()]
 
 
 def measure_drift(worktree_path: Path, base_commit: str) -> Drift | None:

@@ -22,6 +22,7 @@ from lazyfish.artifacts import (
     CONTRACTS,
     ROLE_ARCHITECT,
     TYPE_TECHNICAL_PLAN,
+    TYPE_TEST_ARTIFACT,
     Artifact,
     ArtifactStore,
     canonical_bytes,
@@ -153,9 +154,14 @@ def test_the_serialisation_is_byte_identical_for_equal_content() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_only_the_technical_plan_contract_is_registered() -> None:
-    """One stage this slice: four unverified contracts at once is A-3."""
-    assert set(CONTRACTS) == {TYPE_TECHNICAL_PLAN}
+def test_only_the_stages_that_run_have_contracts() -> None:
+    """One contract per stage that exists, still not four at once (A-3).
+
+    LF-8 registered the second because `tester@write` runs now. The two that are
+    still absent are absent for the original reason: a registered contract with
+    no call site able to reach it is surface nobody can exercise.
+    """
+    assert set(CONTRACTS) == {TYPE_TECHNICAL_PLAN, TYPE_TEST_ARTIFACT}
 
 
 def test_the_contract_names_its_producer() -> None:

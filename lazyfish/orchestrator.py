@@ -27,9 +27,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from .authority import CALL_SITE_ARCHITECT, CALL_SITES, consumes_artifacts_for, has_human_gate
+from .authority import (
+    CALL_SITE_ARCHITECT,
+    CALL_SITE_TESTER_WRITE,
+    CALL_SITES,
+    consumes_artifacts_for,
+    has_human_gate,
+)
 from .db import (
     STATE_ABANDONED,
     STATE_APPROVED,
@@ -43,7 +50,6 @@ from .errors import StateError
 from .rejection import (
     ACTION_HUMAN_REVIEW,
     ACTION_REVISE_PLAN,
-    ROUTE_ARCHITECT,
     ROUTE_HUMAN,
     Finding,
     RejectionArtifact,
@@ -59,13 +65,16 @@ STAGE_ARCHITECT = CALL_SITE_ARCHITECT
 """Kept as an alias: LF-5 named stages, LF-6 named call sites, and they are the
 same list seen from two slices. A stage *is* a call site (LF-7 D2)."""
 
-STAGE_SEQUENCE: tuple[str, ...] = (CALL_SITE_ARCHITECT,)
+STAGE_SEQUENCE: tuple[str, ...] = (CALL_SITE_ARCHITECT, CALL_SITE_TESTER_WRITE)
 """The pipeline, in order. The one place the order exists (LF-7 D2).
 
-One entry, which is what keeps LF-7 a refactor: the machine can express a
-sequence, and the sequence has nothing in it yet. Adding a stage is inserting an
-item here, adding a row to `authority.CALL_SITES`, and registering a contract --
-`LEGAL_TRANSITIONS` and the state vocabulary must not move.
+Two entries. The second was LF-8, and it cost exactly what LF-7 promised:
+one item here, a contract registered, and a row in `authority.CALL_SITES` that
+was already written. `LEGAL_TRANSITIONS` and the state vocabulary did not move.
+
+`tester@write` is last for now, so promoting its artifact completes the ticket.
+The Coder goes between them when it lands, which is an insertion rather than a
+rewrite.
 
 Reordering is reordering this tuple. That is not a hypothetical convenience: the
 Tester was moved from after the Coder to before it while this was still on
@@ -140,14 +149,16 @@ def budget_exceeded(*, stage_attempts: int, ticket_attempts: int) -> str | None:
 def route_for(
     findings: Sequence[Finding],
     previous_findings: Sequence[Finding] | None = None,
+    call_site: str = CALL_SITE_ARCHITECT,
 ) -> str:
     """Where a rejection goes back to.
 
     Two deterministic rules this slice:
 
-    - A contract violation goes back to the layer that produced the artifact.
-      The Architect wrote a plan that does not satisfy the contract, so the
-      Architect is who can fix it.
+    - A contract violation goes back to the call site that produced the
+      artifact. Whoever wrote something that does not satisfy its contract is
+      who can fix it, and the call site is named rather than the role because a
+      role can have two of them (LF-7 D6).
     - The same rule failing twice in a row goes to a person. A layer that could
       fix a problem would have fixed it the second time; repeating the same
       failure is evidence the instruction, not the attempt, is wrong.
@@ -162,7 +173,7 @@ def route_for(
         }
         if repeated:
             return ROUTE_HUMAN
-    return ROUTE_ARCHITECT
+    return call_site
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +241,7 @@ def decide_promotion(
     stage_attempts: int,
     ticket_attempts: int,
     previous_findings: Sequence[Finding] | None = None,
+    call_site: str = CALL_SITE_ARCHITECT,
 ) -> PromotionDecision:
     """Judge one promotion attempt.
 
@@ -246,7 +258,7 @@ def decide_promotion(
         return PromotionDecision(promoted=True, next_state=STATE_PROMOTED)
 
     reason = budget_exceeded(stage_attempts=stage_attempts, ticket_attempts=ticket_attempts)
-    route = ROUTE_HUMAN if reason else route_for(_findings_of(issues), previous_findings)
+    route = ROUTE_HUMAN if reason else route_for(_findings_of(issues), previous_findings, call_site)
     rejection = from_plan_issues(
         issues,
         target_artifact=artifact_id,
@@ -368,7 +380,7 @@ def next_step(task: Any | None) -> NextStep:
     return NextStep(
         state=task.state,
         stage=stage if working else None,
-        workspace=task.worktree_path,
+        workspace=workspace_for(task),
         # From the authority table rather than a second list, and artifacts
         # only: the Architect reads the Ticket, which is not something a runner
         # fetches and applies, so the first stage's tuple is empty by design
@@ -377,6 +389,23 @@ def next_step(task: Any | None) -> NextStep:
         blocked_on=_STOPPED_ON.get(task.state),
         attempt=getattr(task, "attempt", 0) or 0,
     )
+
+
+def workspace_for(task: Any) -> str | None:
+    """The directory the task's current stage works in.
+
+    `worktree_path` is the Architect's, written at prep before any other stage
+    existed. Every stage lives in a sibling directory named after its call site
+    (LF-6 D5), so the layout is derivable rather than stored per stage -- and
+    derivable is what keeps this a pure function.
+    """
+    recorded = getattr(task, "worktree_path", None)
+    if not recorded:
+        return None
+    stage = getattr(task, "current_stage", None)
+    if not stage or stage == CALL_SITE_ARCHITECT:
+        return recorded
+    return str(Path(recorded).parent / stage)
 
 
 def advance_stage(stage: str | None) -> tuple[str | None, str]:
@@ -396,6 +425,16 @@ def advance_stage(stage: str | None) -> tuple[str | None, str]:
     if following is None:
         return None, STATE_COMPLETED
     return following, STATE_AWAITING_ARTIFACT
+
+
+def is_finished(state: str) -> bool:
+    """Whether lazyfish has nothing further to do with a task in this state.
+
+    A predicate rather than a state name the CLI could compare against: which
+    states are terminal is a judgement, and AC9 keeps judgements out of cli.py.
+    The CLI is allowed to ask; it is not allowed to know the answer's shape.
+    """
+    return state in (STATE_COMPLETED, STATE_ABANDONED)
 
 
 def requires_approval(stage: str | None) -> bool:

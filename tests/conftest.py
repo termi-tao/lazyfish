@@ -594,3 +594,67 @@ LEGACY_COLUMNS = (
     "accepted_at",
     "abandoned_at",
 )
+
+
+# --------------------------------------------------------------------------- #
+# The tester stage (LF-8)
+# --------------------------------------------------------------------------- #
+
+
+def workspace_for_tests(env: dict[str, Path], profile: str = "work") -> Path:
+    """Where the tests stage works, for the one live ticket of `profile`.
+
+    Not named `tester_workspace`: pytest collects `test*`, and a helper whose
+    name starts with those four letters is picked up as a test case.
+    """
+    with open_database(env) as database:
+        task = database.get_live(profile)[0]
+    return Path(task.worktree_path).parent / "tester@write"
+
+
+def write_tests(
+    workspace: Path,
+    *,
+    path: str = "tests/test_generated.py",
+    body: str = "def test_generated():\n    assert True\n",
+    coverage: list[dict[str, object]] | None = None,
+    criteria: int = 1,
+) -> Path:
+    """Write a test file and the coverage table that declares it.
+
+    Defaults to covering every criterion of `make_plan`'s plan with the one file
+    it writes, which is what a test that is not about coverage wants.
+    """
+    target = workspace / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+
+    if coverage is None:
+        coverage = [
+            {"ac_id": f"AC{index + 1}", "test_ids": [f"{path}::test_generated"]}
+            for index in range(criteria)
+        ]
+    state = workspace / ".lazyfish"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "tests-coverage.json").write_text(
+        json.dumps({"coverage": coverage}, indent=2), encoding="utf-8"
+    )
+    return target
+
+
+def finish_the_tester_stage(
+    env: dict[str, Path], runner, *, profile: str = "work", criteria: int = 1
+):
+    """Take the ticket through the second stage, so that it completes.
+
+    A ticket no longer ends at `accept`; tests come after it. Tests that are
+    about the first stage use this to reach the end without restating the
+    second.
+    """
+    from lazyfish.cli import cli
+
+    write_tests(workspace_for_tests(env, profile), criteria=criteria)
+    arguments = ["promote"] if profile == "work" else ["--profile", profile, "promote"]
+    result = runner.invoke(cli, arguments)
+    assert result.exit_code == 0, result.stdout + result.stderr
+    return result

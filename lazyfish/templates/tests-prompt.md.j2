@@ -1,0 +1,63 @@
+# Test brief for {{ ticket.key }}
+
+You are writing tests. There is no implementation yet, and there is not supposed
+to be one: these tests are what the implementation will have to satisfy.
+
+Read `CLAUDE.md` in this directory for the ticket, and
+`{{ acceptance_path }}` for the acceptance criteria that were approved. The
+criteria are numbered there; those numbers are what you refer to below.
+
+## This workspace is the baseline, not the design stage's copy
+
+It was built from the recorded base commit. Whatever the design stage wrote in
+its own directory is not here, deliberately: tests written against code that
+already passes describe the code instead of constraining it.
+
+Expect your tests to fail. A test that passes right now is either testing
+something that already worked or not testing what it claims to.
+
+## What to write
+
+1. **The tests themselves**, wherever this repository puts tests.
+2. **`{{ coverage_path }}`**, saying which criterion each test covers:
+
+```json
+{
+  "coverage": [
+    {"ac_id": "AC1", "test_ids": ["tests/test_reset.py::test_link_expires_after_a_day"]},
+    {"ac_id": "AC2", "test_ids": ["tests/test_reset.py::test_an_expired_link_is_refused"]}
+  ]
+}
+```
+
+A `test_id` is `<path from the repository root>::<test name>`. The path is
+checked; the name is for the humans and the review that follow.
+
+One criterion may have several tests, and one test may appear under several
+criteria. Write what is true rather than what is tidy.
+
+## What is checked, and will fail the promotion
+
+| Rule | Meaning |
+| --- | --- |
+| `patch-not-empty` | The workspace is unchanged. Nothing to promote. |
+| `ac-id-known` | An `ac_id` that is not one of the approved criteria. |
+| `ac-covered` | A criterion with no test against it. |
+| `test-declared` | A `test_id` naming a file this work did not touch. |
+
+None of these runs your tests. Whether a test actually exercises the criterion
+it claims is a judgement, and it is made later by a reviewer or by a person --
+which is exactly why the table above has to be honest. A coverage entry written
+to satisfy the checker rather than to describe the tests wastes that review
+instead of passing it.
+
+## What leaves this workspace
+
+Everything you change here, as a patch, except `.lazyfish/` itself.
+
+That includes the implementation, if you change it. Nothing stops you and
+nothing will fail — but the implementation is not yours to write at this stage,
+and a change to it here travels downstream where somebody will build on it
+believing it came from the stage that owns it. If a test cannot be written
+without touching non-test code, say so in the plan's terms and leave it alone;
+if you touch it anyway, say that too, somewhere a person will read it.

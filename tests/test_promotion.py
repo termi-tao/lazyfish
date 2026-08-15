@@ -50,6 +50,7 @@ from .conftest import (
     FakeTracker,
     artifacts_of,
     commit_everything,
+    finish_the_tester_stage,
     git,
     head_commit,
     implement_the_whole_ticket,
@@ -608,6 +609,7 @@ def test_approval_after_promotion_reaches_plan_approved(
     result = runner.invoke(cli, ["accept", "--as-is"])
     assert result.exit_code == 0, result.stdout + result.stderr
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
     assert task.plan_accepted is True
@@ -623,6 +625,7 @@ def test_accept_still_works_in_one_step(
     result = runner.invoke(cli, ["accept", "--as-is"])
     assert result.exit_code == 0, result.stdout + result.stderr
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
     assert promoted_plan(env, task.id) is not None
@@ -756,7 +759,9 @@ def test_the_two_kinds_of_approval_are_distinguishable(
         assert result.exit_code == 0, result.stdout + result.stderr
         worktree = Path(result.stdout.strip().splitlines()[-1][3:])
         write_plan(worktree, ticket=key)
-        assert runner.invoke(cli, arguments, input=stdin).exit_code == 0
+        # Named, because the previous ticket is still live at its tests stage:
+        # a ticket no longer leaves the window at `accept` (LF-6 D8, LF-8).
+        assert runner.invoke(cli, [*arguments, "--ticket", key], input=stdin).exit_code == 0
 
     recorded = {task.ticket_key: task.approved_via for task in tasks_of(env)}
     assert recorded == {"PROJ-1": APPROVAL_INTERACTIVE, "PROJ-2": APPROVAL_NON_INTERACTIVE}
@@ -771,6 +776,7 @@ def test_a_modified_approval_is_also_non_interactive(
     result = runner.invoke(cli, ["accept", "--modified", "--note", "added a migration step"])
     assert result.exit_code == 0, result.stdout + result.stderr
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
     assert task.plan_accepted is False
@@ -809,6 +815,7 @@ def test_choosing_as_is_approves_the_plan_unchanged(
     write_plan(worktree)
     assert runner.invoke(cli, ["accept"], input=f"{ANSWER_AS_IS}\n").exit_code == 0
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
     assert task.plan_accepted is True
@@ -828,6 +835,7 @@ def test_choosing_modified_approves_the_plan_and_keeps_the_note(
     result = runner.invoke(cli, ["accept"], input=f"{ANSWER_MODIFIED}\nmissed the rate limiter\n")
     assert result.exit_code == 0, result.stdout + result.stderr
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
     assert task.plan_accepted is False
@@ -954,10 +962,12 @@ def test_a_plan_rewritten_after_a_human_rejection_can_be_approved(
     write_plan(worktree, understanding="a second plan, written after the rejection")
     assert runner.invoke(cli, ["accept", "--as-is"]).exit_code == 0
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
     assert task.plan_accepted is True
-    assert task.attempt == 2
+    # One run at the tests stage; the Architect's two were cleared on the move.
+    assert task.attempt == 1
 
 
 def test_status_counts_a_modified_acceptance_apart_from_a_rejection(
@@ -980,7 +990,8 @@ def test_status_counts_a_modified_acceptance_apart_from_a_rejection(
         result = runner.invoke(cli, ["prep", "--ticket", key])
         assert result.exit_code == 0, result.stdout + result.stderr
         write_plan(Path(result.stdout.strip().splitlines()[-1][3:]), ticket=key)
-        assert runner.invoke(cli, arguments).exit_code == 0
+        # Named: earlier tickets are still live at their tests stage (LF-8).
+        assert runner.invoke(cli, [*arguments, "--ticket", key]).exit_code == 0
 
     recorded = {task.ticket_key: task.plan_accepted for task in tasks_of(env)}
     assert recorded == {"PROJ-1": True, "PROJ-2": False, "PROJ-3": None}
@@ -1159,7 +1170,12 @@ def test_the_attempt_count_survives_completion(
     write_plan(worktree)
     assert runner.invoke(cli, ["accept", "--as-is"]).exit_code == 0
 
+    finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
-    assert task.attempt == 2
-    assert task.ticket_attempts == 2
+    # `attempt` belongs to the stage the ticket finished at, and the tests stage
+    # took one run. The Architect's two were cleared when the stage moved --
+    # that is the clearing LF-7 D5 is about. What must not be cleared is this
+    # count at the end of the sequence, which is what the assertion pins.
+    assert task.attempt == 1
+    assert task.ticket_attempts == 3

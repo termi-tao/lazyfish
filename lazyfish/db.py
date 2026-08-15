@@ -850,6 +850,29 @@ class Database:
             )
         return self._require(task_id)
 
+    def advance_to(self, task_id: int, *, stage: str | None, state: str) -> Task:
+        """Move a task to the next stage, clearing that stage's attempt count.
+
+        The stage and the counter move in one statement for the reason LF-7 D5
+        gives: a stage that inherits the previous one's spent budget escalates
+        before it has run. At the end of the sequence nothing moves and the
+        count is kept -- how many attempts the last stage took is one of the
+        numbers this tool exists to collect.
+        """
+        task = self._require(task_id)
+        check_transition(task.state, state)
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET state = ?, current_stage = ?, attempt = ? WHERE id = ?",
+                (
+                    state,
+                    stage if stage is not None else task.current_stage,
+                    0 if stage is not None else task.attempt,
+                    task_id,
+                ),
+            )
+        return self._require(task_id)
+
     def mark_abandoned(self, task_id: int, *, notes: str | None = None) -> Task:
         task = self._require(task_id)
         check_transition(task.state, STATE_ABANDONED)

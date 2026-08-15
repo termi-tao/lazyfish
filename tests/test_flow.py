@@ -22,6 +22,7 @@ from lazyfish.trackers.base import Attachment, Comment
 
 from .conftest import (
     FakeTracker,
+    finish_the_tester_stage,
     git,
     make_ticket,
     write_config,
@@ -732,6 +733,7 @@ def test_accepting_with_changes_records_the_note(
 
     result = runner.invoke(cli, ["accept", "--modified", "--note", "missed the rate limiter"])
     assert result.exit_code == 0, result.stdout + result.stderr
+    finish_the_tester_stage(env, runner)
 
     row = tasks_of(env)[0]
     assert row.state == STATE_COMPLETED
@@ -759,10 +761,17 @@ def test_accepting_as_written(
 def test_a_recorded_plan_cannot_be_accepted_twice(
     prepared: tuple[dict[str, Path], Path, FakeTracker], runner: CliRunner
 ) -> None:
-    _, worktree, _ = prepared
+    env, worktree, _ = prepared
     write_plan(worktree)
     assert runner.invoke(cli, ["accept", "--as-is"]).exit_code == 0
 
+    # Straight after approval the ticket is at a stage nobody approves, so the
+    # refusal names that rather than the recorded plan (LF-8 D4).
+    at_the_next_stage = runner.invoke(cli, ["accept", "--as-is"])
+    assert at_the_next_stage.exit_code != 0
+    assert "no person approves" in at_the_next_stage.stderr
+
+    finish_the_tester_stage(env, runner)
     result = runner.invoke(cli, ["accept", "--as-is"])
     assert result.exit_code != 0
     assert "already recorded" in result.stderr
@@ -775,6 +784,7 @@ def test_prep_moves_on_after_a_plan_is_recorded(
     env, worktree, tracker = prepared
     write_plan(worktree)
     assert runner.invoke(cli, ["accept", "--as-is"]).exit_code == 0
+    finish_the_tester_stage(env, runner)
 
     tracker.tickets = [make_ticket("PROJ-2")]
     result = runner.invoke(cli, ["prep"])
@@ -844,7 +854,8 @@ def test_status_reports_rates_and_cycle_time_per_profile(
         result = runner.invoke(cli, ["prep", "--ticket", f"PROJ-{index}"])
         assert result.exit_code == 0, result.stdout + result.stderr
         write_plan(worktree_from(result.stdout), ticket=f"PROJ-{index}")
-        assert runner.invoke(cli, arguments).exit_code == 0
+        # Named: earlier tickets are still live at their tests stage (LF-8).
+        assert runner.invoke(cli, [*arguments, "--ticket", f"PROJ-{index}"]).exit_code == 0
 
     result = runner.invoke(cli, ["status"])
     assert result.exit_code == 0

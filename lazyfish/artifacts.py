@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,9 @@ from .workspace import PLAN_FILENAME, STATE_DIRNAME
 # --------------------------------------------------------------------------- #
 
 TYPE_TECHNICAL_PLAN = authority.TYPE_TECHNICAL_PLAN
+TYPE_TEST_ARTIFACT = authority.TYPE_TEST_ARTIFACT
 ROLE_ARCHITECT = authority.ROLE_ARCHITECT
+ROLE_TESTER = authority.ROLE_TESTER
 """Re-exported from the authority table, which is where they are defined.
 
 Spelled here as aliases rather than as a second pair of string literals: the
@@ -166,11 +169,17 @@ class Contract:
 
     type: str
     produced_by: str
-    extract: Callable[[Path], dict[str, Any]]
+    extract: Callable[..., dict[str, Any]]
     validate: Callable[..., list[PlanIssue]]
 
+    # Both are called with keywords beyond the workspace, and both ignore what
+    # they do not need. A TechnicalPlan is a file and needs nothing else; a
+    # TestArtifact is a diff and needs the commit to diff against. Widening the
+    # signature rather than giving every contract the union of everyone's inputs
+    # keeps the third one from having to care what the first two wanted.
 
-def _extract_technical_plan(workspace: Path) -> dict[str, Any]:
+
+def _extract_technical_plan(workspace: Path, **_: Any) -> dict[str, Any]:
     """Read plan.json out of a workspace, and nothing else."""
     path = Path(workspace) / STATE_DIRNAME / PLAN_FILENAME
     if not path.exists():
@@ -192,7 +201,7 @@ def _extract_technical_plan(workspace: Path) -> dict[str, Any]:
 
 
 def _validate_technical_plan(
-    content: Mapping[str, Any], workspace: Path | None = None
+    content: Mapping[str, Any], workspace: Path | None = None, **_: Any
 ) -> list[PlanIssue]:
     """Judge a plan with the rules that already exist.
 
@@ -203,12 +212,230 @@ def _validate_technical_plan(
     return validate_plan(dict(content), workspace)
 
 
+# --------------------------------------------------------------------------- #
+# TestArtifact (LF-8)
+# --------------------------------------------------------------------------- #
+
+COVERAGE_FILENAME = "tests-coverage.json"
+
+PATCH_FIELD_FILES = "files"
+COVERAGE_FIELD = "coverage"
+
+RULE_PATCH_NOT_EMPTY = "patch-not-empty"
+RULE_AC_ID_KNOWN = "ac-id-known"
+RULE_AC_COVERED = "ac-covered"
+RULE_TEST_DECLARED = "test-declared"
+"""The TestArtifact contract's rules, as ids rather than prose (LF-5 D5).
+
+Ids because a rejection has to be machine-readable, and because "the same rule
+failed twice" -- the routing rule that sends a ticket to a person -- is not
+answerable over free text.
+"""
+
+AC_ID_RE = re.compile(r"^AC([1-9][0-9]*)$")
+"""`AC<n>`, one-based, indexing the promoted plan's `acceptance_criteria`.
+
+The array has no ids of its own and is not being given any: it is required and
+non-empty already, and adding ids would mean changing the plan schema and
+migrating every plan ever promoted. An index into an *immutable* artifact is a
+stable reference -- reordering the criteria produces a different plan, which has
+its own indices (LF-8 D2).
+"""
+
+
+def acceptance_criteria_of(plan: Mapping[str, Any]) -> list[str]:
+    """The promoted plan's acceptance criteria, in order."""
+    criteria = plan.get("acceptance_criteria")
+    return [str(item) for item in criteria] if isinstance(criteria, list) else []
+
+
+def ac_id_for(index: int) -> str:
+    """`AC1` for the first criterion. The one place the numbering is decided.
+
+    Both sides read it from here: the file the Tester is given and the rule that
+    checks what it declared. Two functions agreeing by convention is how the two
+    ends up off by one (LF-8 D5).
+    """
+    return f"AC{index + 1}"
+
+
+def _extract_test_artifact(
+    workspace: Path, base_commit: str | None = None, **_: Any
+) -> dict[str, Any]:
+    """The tests as a diff against the baseline, plus the coverage table.
+
+    The diff is taken from the workspace rather than read from a file the agent
+    wrote. An agent asked to emit a patch produces one whose context lines
+    frequently do not apply, and -- worse -- nothing would ever check that its
+    patch matches the files it just wrote. The mismatched one is what would be
+    promoted.
+
+    Nothing lazyfish wrote enters the patch -- not `.lazyfish/`, not the context
+    file it copied in. Same reason C1 does not count its own files as drift.
+    """
+    from .workspace import STATE_DIRNAME, diff_since
+
+    if not base_commit:
+        raise ValidationError(
+            "No baseline commit recorded for this task, so the tests cannot be "
+            "expressed as a diff. Abandon the ticket and prepare it again."
+        )
+
+    # The default exclusion, which is everything lazyfish wrote into the
+    # workspace: `.lazyfish/`, the context file, the artifacts directory. The
+    # same set C1 keeps out of the drift count, for the same reason -- a stage
+    # is not credited with, or blamed for, the tool's own files.
+    patch, files = diff_since(workspace, base_commit)
+
+    coverage_path = Path(workspace) / STATE_DIRNAME / COVERAGE_FILENAME
+    if not coverage_path.exists():
+        raise ValidationError(
+            f"No {COVERAGE_FILENAME} at {coverage_path}\n"
+            f"The tests stage writes it there, saying which acceptance criterion "
+            f"each test covers. See the brief in that directory."
+        )
+    try:
+        with open(coverage_path, encoding="utf-8") as handle:
+            declared = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(
+            f"{coverage_path} is not valid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    if not isinstance(declared, dict):
+        raise ValidationError(
+            f"{coverage_path} must contain a JSON object, not {type(declared).__name__}."
+        )
+
+    return {
+        PATCH_FIELD: patch,
+        PATCH_FIELD_FILES: files,
+        COVERAGE_FIELD: declared.get(COVERAGE_FIELD),
+    }
+
+
+def _validate_test_artifact(
+    content: Mapping[str, Any],
+    workspace: Path | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+    **_: Any,
+) -> list[PlanIssue]:
+    """Four rules, none of which runs anything (LF-8 D3).
+
+    Deliberately no language knowledge: nothing here parses Python, knows what
+    pytest is, or assumes a `tests/` directory. Every judgement lands on a file
+    path or on the shape of the table, and both hold for any repository.
+
+    What it does not do is bound the patch. A test declared to live in a file
+    must be in a file the patch touched; the reverse -- restricting the patch to
+    the declared files -- is not done, so an implementation the Tester also
+    edited travels with the artifact. That is the decision recorded in
+    known-issues.md §7, not an oversight.
+    """
+    issues: list[PlanIssue] = []
+    criteria = list(acceptance_criteria or [])
+
+    patch = str(content.get(PATCH_FIELD) or "")
+    touched = {str(name) for name in content.get(PATCH_FIELD_FILES) or ()}
+    if not patch.strip():
+        issues.append(
+            PlanIssue(
+                RULE_PATCH_NOT_EMPTY,
+                "patch",
+                "The workspace is unchanged from the baseline, so there are no "
+                "tests to promote. Write the tests, then promote again.",
+            )
+        )
+
+    coverage = content.get(COVERAGE_FIELD)
+    if not isinstance(coverage, list) or not coverage:
+        issues.append(
+            PlanIssue(
+                RULE_AC_COVERED,
+                COVERAGE_FIELD,
+                f"{COVERAGE_FILENAME} must hold a non-empty 'coverage' array of "
+                f"{{ac_id, test_ids}} objects, saying which criterion each test covers.",
+            )
+        )
+        return issues
+
+    covered: set[str] = set()
+    for position, entry in enumerate(coverage):
+        location = f"{COVERAGE_FIELD}[{position}]"
+        if not isinstance(entry, Mapping):
+            issues.append(
+                PlanIssue(RULE_AC_COVERED, location, "Each coverage entry must be an object.")
+            )
+            continue
+
+        ac_id = str(entry.get("ac_id") or "")
+        match = AC_ID_RE.match(ac_id)
+        if match is None or not (1 <= int(match.group(1)) <= len(criteria)):
+            issues.append(
+                PlanIssue(
+                    RULE_AC_ID_KNOWN,
+                    f"{location}.ac_id",
+                    f"{ac_id or '(missing)'} is not a criterion of the approved plan, "
+                    f"which has {len(criteria)} (AC1 to AC{len(criteria)}).",
+                )
+            )
+        else:
+            covered.add(ac_id)
+
+        test_ids = entry.get("test_ids")
+        if not isinstance(test_ids, list) or not test_ids:
+            issues.append(
+                PlanIssue(
+                    RULE_AC_COVERED,
+                    f"{location}.test_ids",
+                    f"{ac_id or 'This entry'} lists no tests. An empty list is a "
+                    f"criterion nothing covers.",
+                )
+            )
+            continue
+
+        for test_id in test_ids:
+            # Only the left of `::`. What the name means, and how a test is
+            # declared, is a property of the language; which file the patch
+            # touched is not.
+            file_part = str(test_id).split("::", 1)[0]
+            if file_part not in touched:
+                issues.append(
+                    PlanIssue(
+                        RULE_TEST_DECLARED,
+                        f"{location}.test_ids",
+                        f"{test_id} names {file_part}, which this patch does not "
+                        f"touch. A declared test that is not in the artifact makes "
+                        f"the coverage table unverifiable.",
+                    )
+                )
+
+    missing = [
+        ac_id_for(index) for index in range(len(criteria)) if ac_id_for(index) not in covered
+    ]
+    if missing:
+        issues.append(
+            PlanIssue(
+                RULE_AC_COVERED,
+                COVERAGE_FIELD,
+                f"No test covers {', '.join(missing)}. Every acceptance criterion "
+                f"of the approved plan needs at least one.",
+            )
+        )
+    return issues
+
+
 CONTRACTS: dict[str, Contract] = {
     TYPE_TECHNICAL_PLAN: Contract(
         type=TYPE_TECHNICAL_PLAN,
         produced_by=ROLE_ARCHITECT,
         extract=_extract_technical_plan,
         validate=_validate_technical_plan,
+    ),
+    TYPE_TEST_ARTIFACT: Contract(
+        type=TYPE_TEST_ARTIFACT,
+        produced_by=ROLE_TESTER,
+        extract=_extract_test_artifact,
+        validate=_validate_test_artifact,
     ),
 }
 """Registered contracts, one per artifact type an agent can produce.
