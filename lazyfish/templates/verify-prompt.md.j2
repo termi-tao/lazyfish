@@ -1,0 +1,42 @@
+# Verification brief for {{ ticket.key }}
+
+The tests and the implementation are both promoted, and this workspace holds
+both — the promoted versions, whatever either stage did to its own copy.
+
+Run the suite and write down what happened.
+
+## Output
+
+Write `{{ report_path }}`:
+
+```json
+{
+  "outcome": "GREEN",
+  "tests": [
+    {"id": "tests/test_reset.py::test_link_expires", "status": "passed"},
+    {"id": "tests/test_reset.py::test_expired_refused", "status": "failed",
+     "failure_kind": "assertion"}
+  ]
+}
+```
+
+`outcome` is `GREEN`, `RED`, or `UNCOLLECTABLE` — the last one when the suite
+could not even be collected, which is a different problem from a failing test.
+
+`failure_kind` is `assertion`, `import`, or `error`.
+
+## Your outcome is checked against a real run
+
+lazyfish runs this repository's configured test command in this workspace and
+keeps its exit code. If your report says GREEN and the command fails, or says
+RED and it passes, the report is rejected.
+
+The per-test detail is not checked. It is read by people and by the review that
+follows, so it is worth getting right for reasons other than passing a check.
+
+## Red is a legitimate outcome
+
+This stage reports; it does not judge. A suite that fails is a fact worth
+recording accurately, and recording it is what lets the failure be acted on.
+Do not adjust the tests or the implementation to make a nicer report — neither
+edit would travel anyway, and the report would then be false as well.

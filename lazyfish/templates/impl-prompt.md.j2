@@ -1,0 +1,27 @@
+# Implementation brief for {{ ticket.key }}
+
+The plan is approved and the tests are written. Your job is to make them pass.
+
+Read `CLAUDE.md` for the ticket and `{{ acceptance_path }}` for the acceptance
+criteria. The tests in this workspace are the promoted ones — they are the
+specification you are working against, in more detail than prose could manage.
+
+## The tests are not yours to change
+
+You can edit them; nothing is locked. But the tests a later stage runs are the
+promoted ones, not your copy, so an edit here changes what you see and nothing
+else. A test that only passes because you altered it will fail the moment
+anybody else looks.
+
+If a test seems wrong, say so where a person will read it rather than editing
+around it.
+
+## What leaves this workspace
+
+Everything you change, as a patch, except the promoted tests and `.lazyfish/`.
+
+## What is checked
+
+Only that the patch is not empty and that it records what it was built on.
+Whether the implementation is *correct* is what the tests are for, and they are
+run at the next stage.

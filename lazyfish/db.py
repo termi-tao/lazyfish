@@ -218,7 +218,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- out of `state` so that adding a stage adds a row to a sequence rather
     -- than a state to a machine. A call site, not a role: a role can have more
     -- than one, and any count taken from roles is wrong (LF-6).
-    current_stage  TEXT
+    current_stage  TEXT,
+    -- What the current stage's workspace looked like when it opened: the
+    -- baseline plus whatever promoted artifacts it consumes, committed once so
+    -- that a diff has something to name (LF-9 D2). `base_commit` stays the
+    -- authoritative baseline; this is scaffolding for extraction.
+    stage_base_commit TEXT
 );
 
 CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, profile);
@@ -294,6 +299,8 @@ ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("workspace_delta_lines", "workspace_delta_lines INTEGER"),
     # LF-7
     ("current_stage", "current_stage TEXT"),
+    # LF-9
+    ("stage_base_commit", "stage_base_commit TEXT"),
 )
 """Columns added to `tasks` after its first shape, oldest first.
 
@@ -362,6 +369,7 @@ class Task:
     # Which call site the ticket is at (LF-7). NULL on rows migrated from a
     # build that had no such column; `_rename_legacy_states` fills those in.
     current_stage: str | None = None
+    stage_base_commit: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -388,6 +396,7 @@ class Task:
             workspace_delta_files=row["workspace_delta_files"],
             workspace_delta_lines=row["workspace_delta_lines"],
             current_stage=row["current_stage"],
+            stage_base_commit=row["stage_base_commit"],
         )
 
     def minutes_to_accept(self) -> float | None:
@@ -847,6 +856,14 @@ class Database:
                     approved_via,
                     task_id,
                 ),
+            )
+        return self._require(task_id)
+
+    def record_stage_base(self, task_id: int, commit: str | None) -> Task:
+        """Remember what the current stage's workspace opened as (LF-9 D2)."""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET stage_base_commit = ? WHERE id = ?", (commit, task_id)
             )
         return self._require(task_id)
 

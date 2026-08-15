@@ -1173,9 +1173,10 @@ def test_the_attempt_count_survives_completion(
     finish_the_tester_stage(env, runner)
     task = task_of(env)
     assert task.state == STATE_COMPLETED
-    # `attempt` belongs to the stage the ticket finished at, and the tests stage
-    # took one run. The Architect's two were cleared when the stage moved --
-    # that is the clearing LF-7 D5 is about. What must not be cleared is this
-    # count at the end of the sequence, which is what the assertion pins.
+    # `attempt` belongs to the stage the ticket finished at -- the last one,
+    # which took a single run. The earlier stages' counts were cleared as the
+    # ticket moved, which is the clearing LF-7 D5 is about; what must not be
+    # cleared is this one, at the end of the sequence.
     assert task.attempt == 1
-    assert task.ticket_attempts == 3
+    # Two at the Architect, one at each stage after it.
+    assert task.ticket_attempts == 5

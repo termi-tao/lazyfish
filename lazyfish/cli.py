@@ -33,6 +33,7 @@ from .artifacts import (
     ROLE_ORCHESTRATOR,
     TYPE_REJECTION,
     TYPE_TECHNICAL_PLAN,
+    TYPE_TEST_REPORT,
     Artifact,
     ArtifactStore,
     Contract,
@@ -99,6 +100,7 @@ from .workspace import (
     remove_ticket_workspaces,
     render_context,
     run_git,
+    run_tests,
     ticket_root,
     write_ticket_json,
 )
@@ -217,6 +219,44 @@ def _approved_criteria(database: Database, store: ArtifactStore, task: Task) -> 
         if artifact.type == TYPE_TECHNICAL_PLAN and artifact.promoted_at is not None:
             return acceptance_criteria_of(store.load(task.id, artifact.id))
     return []
+
+
+def _applied_inputs(database: Database, task: Task, call_site: str) -> tuple[str, ...]:
+    """Ids of the promoted artifacts this call site's workspace was built from.
+
+    Read from the same authority table materialisation used, so that what an
+    artifact says it was built on and what it was actually built on cannot
+    disagree.
+    """
+    consumes = authority.consumes_for(call_site)
+    latest: dict[str, str] = {}
+    for artifact in database.list_artifacts(task.id):
+        if artifact.promoted_at is not None and artifact.type in consumes:
+            latest[artifact.type] = artifact.id
+    return tuple(latest[name] for name in consumes if name in latest)
+
+
+def _run_the_tests(profile: Profile, workspace: Path, artifact_type: str) -> int | None:
+    """Run the repository's tests, for the one contract whose judgement needs it.
+
+    Returns None for every other contract rather than being called conditionally
+    at the call site: which artifacts need a test run is a property of the
+    contract, and spreading that knowledge into `_decide` would put a second
+    copy of it there.
+    """
+    if artifact_type != TYPE_TEST_REPORT:
+        return None
+    if not profile.test_command:
+        raise LazyfishError(
+            f"Profile '{profile.name}' has no test_command, so a test report "
+            f"cannot be checked against a real run.\n"
+            f"Add one to your config:\n"
+            f"    [profile.{profile.name}]\n"
+            f'    test_command = "pytest -q"\n'
+            f"lazyfish runs it in the workspace and reads its exit code, nothing else."
+        )
+    note(f"Running: {profile.test_command}")
+    return run_tests(workspace, profile.test_command, profile.test_timeout_seconds)
 
 
 def _artifact_store() -> ArtifactStore:
@@ -1274,7 +1314,14 @@ def _decide(
     # Read before the state guard so that a repeat promotion of identical
     # content is decidable, and before the attempt is charged so that a
     # workspace with nothing in it does not spend budget.
-    plan = contract.extract(worktree.path, base_commit=task.base_commit)
+    plan = contract.extract(
+        worktree.path,
+        # Stages after the first diff against what their workspace opened as,
+        # which already holds the artifacts they consume (LF-9 D1).
+        base_commit=task.stage_base_commit or task.base_commit,
+        applied=_applied_inputs(database, task, call_site),
+        test_exit_code=_run_the_tests(profile, worktree.path, contract.type),
+    )
     identifier = content_id(plan)
 
     # Promoting the same content again is a no-op, not a second promotion. The
@@ -1383,6 +1430,10 @@ def _advance(ctx: click.Context, database: Database, task: Task, call_site: str)
     following, next_state = advance_stage(call_site)
     if following is not None:
         workspace = materialize(task, following)
+        # What that workspace opened as, so the next stage's diff has something
+        # to be taken against (LF-9 D2). Recorded before the move, because after
+        # it the task is at a stage whose opening state would be unknown.
+        database.record_stage_base(task.id, workspace.opened_at)
         note(f"Prepared the {following} workspace at {workspace.path}")
     database.advance_to(task.id, stage=following, state=next_state)
     return next_state
@@ -1617,6 +1668,7 @@ def accept(
         following, next_state = advance_stage(task.current_stage)
         if following is not None:
             workspace = materialize(task, following)
+            database.record_stage_base(task.id, workspace.opened_at)
             note(f"Prepared the {following} workspace at {workspace.path}")
         task = database.mark_accepted(
             task.id,

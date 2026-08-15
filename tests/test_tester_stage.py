@@ -21,7 +21,7 @@ from lazyfish.artifacts import (
     RULE_TEST_DECLARED,
 )
 from lazyfish.cli import cli
-from lazyfish.db import STATE_AWAITING_ARTIFACT, STATE_COMPLETED, STATE_PROMOTED
+from lazyfish.db import STATE_AWAITING_ARTIFACT, STATE_PROMOTED
 
 from .conftest import (
     FakeTracker,
@@ -139,8 +139,11 @@ def test_promoting_the_tests_completes_the_ticket(
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "TestArtifact" in result.stdout
 
+    # No human gate here, so passing the contract is the whole event: the ticket
+    # moves to the next stage rather than waiting for an approval.
     task = task_of(env)
-    assert task.state == STATE_COMPLETED
+    assert task.state == STATE_AWAITING_ARTIFACT
+    assert task.current_stage == "coder"
     assert task.state != STATE_PROMOTED
 
 
@@ -324,7 +327,7 @@ def test_a_corrected_table_promotes_after_a_rejection(
 
     write_tests(workspace, criteria=len(TWO_CRITERIA))
     assert runner.invoke(cli, ["promote"]).exit_code == 0
-    assert task_of(env).state == STATE_COMPLETED
+    assert task_of(env).current_stage == "coder"
 
 
 # --------------------------------------------------------------------------- #
@@ -365,7 +368,7 @@ def test_the_contract_does_not_know_what_language_this_is(
 
     result = runner.invoke(cli, ["promote"])
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert task_of(env).state == STATE_COMPLETED
+    assert task_of(env).current_stage == "coder"
 
 
 # --------------------------------------------------------------------------- #
@@ -379,6 +382,6 @@ def test_the_sequence_grew_and_the_states_did_not() -> None:
     from lazyfish.db import LEGAL_TRANSITIONS
     from lazyfish.orchestrator import STAGE_SEQUENCE
 
-    assert STAGE_SEQUENCE == (CALL_SITE_ARCHITECT, CALL_SITE_TESTER_WRITE)
+    assert STAGE_SEQUENCE[:2] == (CALL_SITE_ARCHITECT, CALL_SITE_TESTER_WRITE)
     # The seven states LF-7 settled on, unchanged by a stage being added.
     assert len(LEGAL_TRANSITIONS) == 7

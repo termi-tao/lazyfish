@@ -14,6 +14,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -227,6 +228,13 @@ class Workspace:
     call_site: str
     base_commit: str
     applied: tuple[str, ...]
+    opened_at: str | None = None
+    """The commit this workspace opened as: the baseline plus what it consumes.
+
+    A stage's own work is what came after this, so it is what a diff has to be
+    taken against (LF-9 D2). Local to this directory's detached HEAD -- it names
+    a starting point, it does not claim any authority `base_commit` has.
+    """
 
 
 def materialize(task: Any, call_site: str) -> Workspace:
@@ -286,6 +294,13 @@ def materialize(task: Any, call_site: str) -> Workspace:
 
     store = ArtifactStore(data_home() / "artifacts")
     applied: list[str] = []
+    # Files an earlier artifact in this build already owns. A later patch is not
+    # allowed to rewrite them, which is LF-6 AC1 -- "the tests a downstream
+    # stage sees are byte for byte the promoted ones" -- finally becoming
+    # reachable now that a Coder exists to violate it (LF-9 D3). Enforced here
+    # rather than by restricting what the Coder may produce: its patch still
+    # records everything it changed, that part simply does not travel.
+    spoken_for: set[str] = set()
     for artifact in promoted:
         if not carries_patch(artifact.type):
             continue
@@ -302,8 +317,10 @@ def materialize(task: Any, call_site: str) -> Workspace:
                 f"so the workspace for {call_site} cannot be built from it. "
                 f"Promote a replacement, or abandon the task and start again."
             )
-        _apply_patch(target, patch, artifact.id)
+        content = store.load(task.id, artifact.id)
+        _apply_patch(target, patch, artifact.id, exclude=sorted(spoken_for))
         applied.append(artifact.id)
+        spoken_for.update(str(name) for name in content.get("files") or ())
 
     _write_context_inputs(task, call_site, target, consumes, database_path=db_path())
 
@@ -312,7 +329,35 @@ def materialize(task: Any, call_site: str) -> Workspace:
         call_site=call_site,
         base_commit=task.base_commit,
         applied=tuple(applied),
+        opened_at=_commit_the_opening_state(target, call_site) if applied else task.base_commit,
     )
+
+
+def _commit_the_opening_state(target: Path, call_site: str) -> str:
+    """Commit what materialisation just built, and return its sha (LF-9 D2).
+
+    A stage whose workspace already holds promoted artifacts cannot diff against
+    the bare baseline -- it would present the artifacts it was given as its own
+    work. The combined tree needs a name, and committing is how a tree gets one.
+
+    On the detached HEAD materialisation created, so no branch moves and nothing
+    is pushed. `.lazyfish/` is excluded for the usual reason: lazyfish wrote it.
+    """
+    excludes = [f":(exclude){path}" for path in TOOL_WRITTEN_PATHS]
+    run_git(target, "add", "-A", "--", ".", *excludes)
+    run_git(
+        target,
+        "-c",
+        "user.email=lazyfish@localhost",
+        "-c",
+        "user.name=lazyfish",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        f"lazyfish: {call_site} workspace as opened",
+    )
+    return run_git(target, "rev-parse", "HEAD").stdout.strip()
 
 
 class _TicketStub:
@@ -354,6 +399,7 @@ def _write_context_inputs(
     """
     from .artifacts import (
         COVERAGE_FILENAME,
+        REPORT_FILENAME,
         TYPE_TECHNICAL_PLAN,
         ArtifactStore,
         ac_id_for,
@@ -417,6 +463,7 @@ def _write_context_inputs(
                 ticket=_ticket_stub(task),
                 acceptance_path=f"{STATE_DIRNAME}/{ACCEPTANCE_FILENAME}",
                 coverage_path=f"{STATE_DIRNAME}/{COVERAGE_FILENAME}",
+                report_path=f"{STATE_DIRNAME}/{REPORT_FILENAME}",
             )
         )
         (state_dir / template.removesuffix(".j2")).write_text(brief, encoding="utf-8")
@@ -456,17 +503,22 @@ def _replace_worktree(profile: Profile, target: Path, base_commit: str) -> None:
     run_git(profile.repo, "worktree", "add", "--detach", str(target), base_commit)
 
 
-def _apply_patch(target: Path, patch: str, artifact_id: str) -> None:
+def _apply_patch(target: Path, patch: str, artifact_id: str, exclude: Sequence[str] = ()) -> None:
     """Apply one artifact's unified diff to a materialised workspace.
 
     A diff and not a commit, and applied to the working tree rather than merged:
     taking a commit would mean trusting refs inside the workspace an agent was
     given, which is the state most obviously under its control (D4, Q5).
+
+    `exclude` names files an earlier artifact in the same build already owns, so
+    that a later stage's patch cannot rewrite an earlier one's contribution
+    (LF-9 D3). Empty for the first patch, which is the common case.
     """
     text = patch if patch.endswith("\n") else patch + "\n"
+    exclusions = [f"--exclude={path}" for path in exclude]
     try:
         result = subprocess.run(
-            ["git", "-C", str(target), "apply", "--whitespace=nowarn", "-"],
+            ["git", "-C", str(target), "apply", "--whitespace=nowarn", *exclusions, "-"],
             input=text,
             capture_output=True,
             text=True,
@@ -511,6 +563,8 @@ ACCEPTANCE_FILENAME = "acceptance.md"
 
 STAGE_BRIEFS = {
     authority.CALL_SITE_TESTER_WRITE: "tests-prompt.md.j2",
+    authority.CALL_SITE_CODER: "impl-prompt.md.j2",
+    authority.CALL_SITE_TESTER_VERIFY: "verify-prompt.md.j2",
 }
 """The brief each stage's workspace gets, where it has one.
 
@@ -570,6 +624,49 @@ def diff_since(
         patch = run("diff", "--cached", "--binary", base_commit).stdout
         names = run("diff", "--cached", "--name-only", base_commit).stdout
     return patch, [line for line in names.splitlines() if line.strip()]
+
+
+def run_tests(workspace_path: Path, command: str, timeout_seconds: float) -> int:
+    """Run the repository's own test command in a workspace, and return its code.
+
+    The exit code and nothing else. Reading the output would mean knowing one
+    framework's format, and the core does not know any -- what it needs is the
+    single fact every runner agrees on: did this pass (LF-9 D4).
+
+    Running a command the user configured is not the invariant's concern. The
+    rule is that lazyfish starts no *AI* process; a test suite is the user's own
+    tooling, executed in their own repository's terms.
+
+    lazyfish's own environment variables are removed before the run. A suite
+    that could see LAZYFISH_DATA_DIR might read or write the tool's state, and a
+    test run reaching into the tool measuring it is a loop nobody wants to debug.
+    """
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("LAZYFISH_")
+    }
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise WorkspaceError(
+            f"The configured test_command could not be run: {exc}\n"
+            f"Command: {command}\n"
+            f"It runs in the workspace, so anything it needs has to be on PATH there."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(
+            f"The test command did not finish within {timeout_seconds:g}s and was "
+            f"stopped.\nCommand: {command}\n"
+            f"Raise test_timeout_seconds in the profile if the suite is simply slow."
+        ) from exc
+    return result.returncode
 
 
 def measure_drift(worktree_path: Path, base_commit: str) -> Drift | None:

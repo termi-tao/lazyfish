@@ -157,11 +157,16 @@ def test_the_serialisation_is_byte_identical_for_equal_content() -> None:
 def test_only_the_stages_that_run_have_contracts() -> None:
     """One contract per stage that exists, still not four at once (A-3).
 
-    LF-8 registered the second because `tester@write` runs now. The two that are
-    still absent are absent for the original reason: a registered contract with
-    no call site able to reach it is surface nobody can exercise.
+    Registered one slice at a time as their stages arrived, never four at once.
+    The Reviewer's is still absent for the original reason: a contract no call
+    site can reach is surface nobody can exercise.
     """
-    assert set(CONTRACTS) == {TYPE_TECHNICAL_PLAN, TYPE_TEST_ARTIFACT}
+    assert set(CONTRACTS) == {
+        TYPE_TECHNICAL_PLAN,
+        TYPE_TEST_ARTIFACT,
+        "ImplementationPatch",
+        "TestReport",
+    }
 
 
 def test_the_contract_names_its_producer() -> None:

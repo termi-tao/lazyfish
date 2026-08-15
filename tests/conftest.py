@@ -181,8 +181,16 @@ def write_credentials(
 
 @pytest.fixture
 def configured(env: dict[str, Path], repo: Path) -> dict[str, Path]:
-    """One profile named 'work', with credentials on disk at mode 600."""
-    write_config(env["config"], profiles={"work": {"repo": str(repo)}})
+    """One profile named 'work', with credentials on disk at mode 600.
+
+    `test_command` is a shell no-op: the verification stage runs whatever the
+    profile configures, and a suite that always passes keeps tests that are not
+    about verification from depending on one.
+    """
+    write_config(
+        env["config"],
+        profiles={"work": {"repo": str(repo), "test_command": "sh -c 'exit 0'"}},
+    )
     write_credentials(env["credentials"])
     return env
 
@@ -601,17 +609,6 @@ LEGACY_COLUMNS = (
 # --------------------------------------------------------------------------- #
 
 
-def workspace_for_tests(env: dict[str, Path], profile: str = "work") -> Path:
-    """Where the tests stage works, for the one live ticket of `profile`.
-
-    Not named `tester_workspace`: pytest collects `test*`, and a helper whose
-    name starts with those four letters is picked up as a test case.
-    """
-    with open_database(env) as database:
-        task = database.get_live(profile)[0]
-    return Path(task.worktree_path).parent / "tester@write"
-
-
 def write_tests(
     workspace: Path,
     *,
@@ -642,19 +639,63 @@ def write_tests(
     return target
 
 
-def finish_the_tester_stage(
-    env: dict[str, Path], runner, *, profile: str = "work", criteria: int = 1
-):
-    """Take the ticket through the second stage, so that it completes.
+def stage_workspace(env: dict[str, Path], call_site: str, profile: str = "work") -> Path:
+    """Where one call site works, for the one live ticket of `profile`."""
+    with open_database(env) as database:
+        task = database.get_live(profile)[0]
+    return Path(task.worktree_path).parent / call_site
 
-    A ticket no longer ends at `accept`; tests come after it. Tests that are
-    about the first stage use this to reach the end without restating the
-    second.
+
+def workspace_for_tests(env: dict[str, Path], profile: str = "work") -> Path:
+    """Where the tests stage works, for the one live ticket of `profile`.
+
+    Not named `tester_workspace`: pytest collects `test*`, and a helper whose
+    name starts with those four letters is picked up as a test case.
     """
+    return stage_workspace(env, "tester@write", profile)
+
+
+def write_implementation(
+    workspace: Path, path: str = "src/auth/reset_token.py", body: str = "RESET_TOKEN_TTL = 86400\n"
+) -> Path:
+    target = workspace / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
+def write_report(workspace: Path, outcome: str = "GREEN", tests: list | None = None) -> Path:
+    state = workspace / ".lazyfish"
+    state.mkdir(parents=True, exist_ok=True)
+    path = state / "test-report.json"
+    path.write_text(
+        json.dumps({"outcome": outcome, "tests": tests or []}, indent=2), encoding="utf-8"
+    )
+    return path
+
+
+def promote(runner, profile: str = "work"):
     from lazyfish.cli import cli
 
-    write_tests(workspace_for_tests(env, profile), criteria=criteria)
     arguments = ["promote"] if profile == "work" else ["--profile", profile, "promote"]
     result = runner.invoke(cli, arguments)
     assert result.exit_code == 0, result.stdout + result.stderr
     return result
+
+
+def finish_the_tester_stage(
+    env: dict[str, Path], runner, *, profile: str = "work", criteria: int = 1
+):
+    """Take the ticket through every stage after the plan, so that it completes.
+
+    A ticket no longer ends at `accept`. Tests that are about the first stage
+    use this to reach the end without restating the three that follow.
+    """
+    write_tests(workspace_for_tests(env, profile), criteria=criteria)
+    promote(runner, profile)
+
+    write_implementation(stage_workspace(env, "coder", profile))
+    promote(runner, profile)
+
+    write_report(stage_workspace(env, "tester@verify", profile))
+    return promote(runner, profile)

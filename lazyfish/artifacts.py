@@ -38,8 +38,11 @@ from .workspace import PLAN_FILENAME, STATE_DIRNAME
 
 TYPE_TECHNICAL_PLAN = authority.TYPE_TECHNICAL_PLAN
 TYPE_TEST_ARTIFACT = authority.TYPE_TEST_ARTIFACT
+TYPE_IMPLEMENTATION_PATCH = authority.TYPE_IMPLEMENTATION_PATCH
+TYPE_TEST_REPORT = authority.TYPE_TEST_REPORT
 ROLE_ARCHITECT = authority.ROLE_ARCHITECT
 ROLE_TESTER = authority.ROLE_TESTER
+ROLE_CODER = authority.ROLE_CODER
 """Re-exported from the authority table, which is where they are defined.
 
 Spelled here as aliases rather than as a second pair of string literals: the
@@ -424,6 +427,174 @@ def _validate_test_artifact(
     return issues
 
 
+# --------------------------------------------------------------------------- #
+# ImplementationPatch and TestReport (LF-9)
+# --------------------------------------------------------------------------- #
+
+REPORT_FILENAME = "test-report.json"
+
+APPLIED_FIELD = "applied_artifacts"
+OUTCOME_FIELD = "outcome"
+
+OUTCOME_RED = "RED"
+OUTCOME_GREEN = "GREEN"
+OUTCOME_UNCOLLECTABLE = "UNCOLLECTABLE"
+OUTCOMES = frozenset({OUTCOME_RED, OUTCOME_GREEN, OUTCOME_UNCOLLECTABLE})
+
+RULE_INPUTS_DECLARED = "inputs-declared"
+RULE_OUTCOME_KNOWN = "outcome-known"
+RULE_OUTCOME_MATCHES_RUN = "outcome-matches-run"
+
+
+def _extract_patch_artifact(
+    workspace: Path, base_commit: str | None = None, applied: Sequence[str] = (), **_: Any
+) -> dict[str, Any]:
+    """A stage's work as a diff against the state its workspace opened in.
+
+    Not against the baseline: this workspace was materialised with promoted
+    artifacts already applied, and diffing against the bare baseline would
+    present those as this stage's own work (LF-9 D1).
+    """
+    from .workspace import diff_since
+
+    if not base_commit:
+        raise ValidationError(
+            "This workspace has no recorded opening commit, so the work in it "
+            "cannot be expressed as a diff. Abandon the ticket and prepare it again."
+        )
+    patch, files = diff_since(workspace, base_commit)
+    return {
+        PATCH_FIELD: patch,
+        PATCH_FIELD_FILES: files,
+        APPLIED_FIELD: list(applied),
+    }
+
+
+def _validate_implementation_patch(
+    content: Mapping[str, Any], workspace: Path | None = None, **_: Any
+) -> list[PlanIssue]:
+    """Two rules. Whether the implementation is *right* is not one of them.
+
+    That judgement belongs to the tests, which already exist by now, and to the
+    review that follows. A contract can say the work is present and says what it
+    was built on; it cannot say the work is correct.
+    """
+    issues: list[PlanIssue] = []
+    if not str(content.get(PATCH_FIELD) or "").strip():
+        issues.append(
+            PlanIssue(
+                RULE_PATCH_NOT_EMPTY,
+                "patch",
+                "The workspace is unchanged, so there is no implementation to "
+                "promote. Write it, then promote again.",
+            )
+        )
+    if not content.get(APPLIED_FIELD):
+        issues.append(
+            PlanIssue(
+                RULE_INPUTS_DECLARED,
+                APPLIED_FIELD,
+                "This patch does not record which promoted artifacts it was built "
+                "on. Lineage is what makes a later stage reproducible.",
+            )
+        )
+    return issues
+
+
+def _extract_test_report(
+    workspace: Path, applied: Sequence[str] = (), test_exit_code: int | None = None, **_: Any
+) -> dict[str, Any]:
+    """The agent's report, plus the exit code of the run lazyfish did itself.
+
+    Both, because neither alone is enough (LF-9 D4). A report with no run is a
+    self-assessment, and this project has already learned four times over what
+    those are worth. A run with no report means parsing test output, which would
+    weld one framework's format into the core.
+    """
+    path = Path(workspace) / STATE_DIRNAME / REPORT_FILENAME
+    if not path.exists():
+        raise ValidationError(
+            f"No {REPORT_FILENAME} at {path}\n"
+            f"The verification stage writes it there, saying what the tests did. "
+            f"See the brief in that directory."
+        )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            reported = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(
+            f"{path} is not valid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    if not isinstance(reported, dict):
+        raise ValidationError(f"{path} must contain a JSON object, not {type(reported).__name__}.")
+
+    return {
+        OUTCOME_FIELD: reported.get(OUTCOME_FIELD),
+        "tests": reported.get("tests"),
+        APPLIED_FIELD: list(applied),
+        "test_exit_code": test_exit_code,
+    }
+
+
+def _validate_test_report(
+    content: Mapping[str, Any], workspace: Path | None = None, **_: Any
+) -> list[PlanIssue]:
+    """The report has to agree with what actually happened.
+
+    lazyfish ran the configured command and kept its exit code, which is the one
+    fact about a test run that holds in every language. Comparing it against the
+    reported outcome catches the failure that matters: a stage saying the suite
+    is green when it is not.
+
+    The per-test detail is the agent's word and nothing checks it. Said plainly
+    rather than left to be assumed -- that half belongs to review.
+    """
+    issues: list[PlanIssue] = []
+    outcome = content.get(OUTCOME_FIELD)
+    if outcome not in OUTCOMES:
+        issues.append(
+            PlanIssue(
+                RULE_OUTCOME_KNOWN,
+                OUTCOME_FIELD,
+                f"{outcome!r} is not one of {', '.join(sorted(OUTCOMES))}.",
+            )
+        )
+        return issues
+
+    if not content.get(APPLIED_FIELD):
+        issues.append(
+            PlanIssue(
+                RULE_INPUTS_DECLARED,
+                APPLIED_FIELD,
+                "This report does not record which promoted artifacts were under "
+                "test, so it cannot be tied to what it judged.",
+            )
+        )
+
+    exit_code = content.get("test_exit_code")
+    if exit_code is not None:
+        passed = exit_code == 0
+        if passed and outcome != OUTCOME_GREEN:
+            issues.append(
+                PlanIssue(
+                    RULE_OUTCOME_MATCHES_RUN,
+                    OUTCOME_FIELD,
+                    f"The report says {outcome}, but the test command exited 0. "
+                    f"lazyfish ran it in the same workspace.",
+                )
+            )
+        elif not passed and outcome == OUTCOME_GREEN:
+            issues.append(
+                PlanIssue(
+                    RULE_OUTCOME_MATCHES_RUN,
+                    OUTCOME_FIELD,
+                    f"The report says GREEN, but the test command exited "
+                    f"{exit_code}. lazyfish ran it in the same workspace.",
+                )
+            )
+    return issues
+
+
 CONTRACTS: dict[str, Contract] = {
     TYPE_TECHNICAL_PLAN: Contract(
         type=TYPE_TECHNICAL_PLAN,
@@ -436,6 +607,18 @@ CONTRACTS: dict[str, Contract] = {
         produced_by=ROLE_TESTER,
         extract=_extract_test_artifact,
         validate=_validate_test_artifact,
+    ),
+    TYPE_IMPLEMENTATION_PATCH: Contract(
+        type=TYPE_IMPLEMENTATION_PATCH,
+        produced_by=ROLE_CODER,
+        extract=_extract_patch_artifact,
+        validate=_validate_implementation_patch,
+    ),
+    TYPE_TEST_REPORT: Contract(
+        type=TYPE_TEST_REPORT,
+        produced_by=ROLE_TESTER,
+        extract=_extract_test_report,
+        validate=_validate_test_report,
     ),
 }
 """Registered contracts, one per artifact type an agent can produce.

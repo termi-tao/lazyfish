@@ -56,6 +56,7 @@ PROFILE_ENV = "LAZYFISH_PROFILE"
 DEFAULT_CONVENTIONS_PATH = ".lazyfish/conventions.md"
 DEFAULT_BRANCH_PREFIX = "lazyfish/"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_TEST_TIMEOUT_SECONDS = 600.0
 DEFAULT_ATTACHMENT_MAX_BYTES = 100_000
 
 DEFAULT_ATTACHMENT_MIME_ALLOWLIST = (
@@ -84,6 +85,8 @@ OVERRIDABLE_KEYS = (
     "timeout_seconds",
     "attachment_max_bytes",
     "attachment_mime_allowlist",
+    "test_command",
+    "test_timeout_seconds",
 )
 """Everything else: settable in [defaults], overridable per profile."""
 
@@ -138,6 +141,12 @@ class Profile:
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     attachment_max_bytes: int = DEFAULT_ATTACHMENT_MAX_BYTES
     attachment_mime_allowlist: tuple[str, ...] = DEFAULT_ATTACHMENT_MIME_ALLOWLIST
+    # How this repository runs its tests, and how long to let it. No default is
+    # possible: guessing `pytest` fails in a way nobody can read on a repository
+    # that is not Python, so the verification stage refuses rather than guesses
+    # (LF-9 D5).
+    test_command: str | None = None
+    test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS
 
     def conventions_path(self) -> Path | None:
         """Resolve the conventions file, or None when the section is switched off.
@@ -377,6 +386,8 @@ _PARSERS: dict[str, Callable[[str, Mapping[str, object], str], Any]] = {
     "timeout_seconds": _as_positive_number,
     "attachment_max_bytes": _as_non_negative_int,
     "attachment_mime_allowlist": _as_str_list,
+    "test_command": _as_optional_str,
+    "test_timeout_seconds": _as_positive_number,
 }
 
 _FALLBACKS: dict[str, Any] = {
@@ -389,6 +400,8 @@ _FALLBACKS: dict[str, Any] = {
     "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
     "attachment_max_bytes": DEFAULT_ATTACHMENT_MAX_BYTES,
     "attachment_mime_allowlist": DEFAULT_ATTACHMENT_MIME_ALLOWLIST,
+    "test_command": None,
+    "test_timeout_seconds": DEFAULT_TEST_TIMEOUT_SECONDS,
 }
 
 

@@ -32,6 +32,8 @@ from typing import Any
 
 from .authority import (
     CALL_SITE_ARCHITECT,
+    CALL_SITE_CODER,
+    CALL_SITE_TESTER_VERIFY,
     CALL_SITE_TESTER_WRITE,
     CALL_SITES,
     consumes_artifacts_for,
@@ -65,16 +67,23 @@ STAGE_ARCHITECT = CALL_SITE_ARCHITECT
 """Kept as an alias: LF-5 named stages, LF-6 named call sites, and they are the
 same list seen from two slices. A stage *is* a call site (LF-7 D2)."""
 
-STAGE_SEQUENCE: tuple[str, ...] = (CALL_SITE_ARCHITECT, CALL_SITE_TESTER_WRITE)
+STAGE_SEQUENCE: tuple[str, ...] = (
+    CALL_SITE_ARCHITECT,
+    CALL_SITE_TESTER_WRITE,
+    CALL_SITE_CODER,
+    CALL_SITE_TESTER_VERIFY,
+)
 """The pipeline, in order. The one place the order exists (LF-7 D2).
 
-Two entries. The second was LF-8, and it cost exactly what LF-7 promised:
-one item here, a contract registered, and a row in `authority.CALL_SITES` that
-was already written. `LEGAL_TRANSITIONS` and the state vocabulary did not move.
+Four entries, added one slice at a time and each costing what LF-7 promised:
+an item here, a contract registered, and a row in `authority.CALL_SITES` that
+LF-6 had already written. `LEGAL_TRANSITIONS` and the state vocabulary have not
+moved once.
 
-`tester@write` is last for now, so promoting its artifact completes the ticket.
-The Coder goes between them when it lands, which is an insertion rather than a
-rewrite.
+The order is ruling 2's: tests are written before the implementation, so they
+constrain it rather than describe it, and the Tester runs a second time
+afterwards to say what they now do. The Reviewer's two call sites are the ones
+still missing.
 
 Reordering is reordering this tuple. That is not a hypothetical convenience: the
 Tester was moved from after the Coder to before it while this was still on
