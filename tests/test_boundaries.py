@@ -15,7 +15,7 @@ import pytest
 from click.testing import CliRunner, Result
 
 from lazyfish.cli import cli
-from lazyfish.db import Database
+from lazyfish.db import STATE_COMPLETED, Database
 from lazyfish.errors import LazyfishError, StateError, WorkspaceError
 
 from .conftest import (
@@ -370,11 +370,17 @@ def test_notes_are_preserved_or_appended_when_a_plan_is_accepted(tmp_path: Path)
     )
     database.conn.execute(
         "UPDATE tasks SET state = ?, notes = ? WHERE id = ?",
-        ("PLAN_PROMOTED", "rejected because the rollback path was absent", task.id),
+        ("PROMOTED", "rejected because the rollback path was absent", task.id),
     )
     database.conn.commit()
 
-    appended = database.mark_accepted(task.id, plan_accepted=True, notes="accepted after revision")
+    appended = database.mark_accepted(
+        task.id,
+        plan_accepted=True,
+        next_stage=None,
+        next_state=STATE_COMPLETED,
+        notes="accepted after revision",
+    )
     assert (
         appended.notes == "rejected because the rollback path was absent\naccepted after revision"
     )
@@ -390,10 +396,12 @@ def test_notes_are_preserved_or_appended_when_a_plan_is_accepted(tmp_path: Path)
     )
     database.conn.execute(
         "UPDATE tasks SET state = ?, notes = ? WHERE id = ?",
-        ("PLAN_PROMOTED", "human rejection survives", kept_task.id),
+        ("PROMOTED", "human rejection survives", kept_task.id),
     )
     database.conn.commit()
-    kept = database.mark_accepted(kept_task.id, plan_accepted=True)
+    kept = database.mark_accepted(
+        kept_task.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED
+    )
     assert kept.notes == "human rejection survives"
 
 
@@ -443,7 +451,7 @@ def test_the_database_rejects_a_duplicate_live_ticket_inserted_with_raw_sql(tmp_
             "PROJ-1",
             "first",
             "work",
-            "PLAN_PROMOTED",
+            "PROMOTED",
             "one",
             "/tmp/one",
             "/tmp/a",
@@ -460,7 +468,7 @@ def test_the_database_rejects_a_duplicate_live_ticket_inserted_with_raw_sql(tmp_
                 "PROJ-1",
                 "duplicate",
                 "work",
-                "READY_FOR_PLAN",
+                "AWAITING_ARTIFACT",
                 "two",
                 "/tmp/two",
                 "/tmp/b",
@@ -484,7 +492,7 @@ def test_old_wip_index_migrates_without_losing_rows_and_is_idempotent(tmp_path: 
                 plan_accepted INTEGER, notes TEXT, prepared_at TEXT NOT NULL, accepted_at TEXT,
                 abandoned_at TEXT);
             CREATE UNIQUE INDEX ux_tasks_in_flight_profile ON tasks (profile)
-                WHERE state = 'READY_FOR_PLAN';"""
+                WHERE state = 'READY_FOR_PLAN';"""  # retired-vocabulary: on purpose
         )
         connection.execute(
             """INSERT INTO tasks VALUES (1, 'OLD-1', 'legacy', 'work', 'ABANDONED', 'old',
@@ -512,7 +520,7 @@ def test_old_wip_index_migrates_without_losing_rows_and_is_idempotent(tmp_path: 
     finally:
         connection.close()
     assert row == ("OLD-1", "keep this")
-    assert any("profile, ticket_key" in sql and "PLAN_PROMOTED" in sql for sql in index_sql)
+    assert any("profile, ticket_key" in sql and "PROMOTED" in sql for sql in index_sql)
     assert not any("ON tasks (profile)" in sql for sql in index_sql)
 
 
@@ -743,7 +751,7 @@ def test_notes_are_preserved_or_appended_when_a_task_is_abandoned(tmp_path: Path
     )
     database.conn.execute(
         "UPDATE tasks SET state = ?, notes = ? WHERE id = ?",
-        ("PLAN_PROMOTED", "rejected because the rollback path was absent", task.id),
+        ("PROMOTED", "rejected because the rollback path was absent", task.id),
     )
     database.conn.commit()
 
@@ -763,7 +771,7 @@ def test_notes_are_preserved_or_appended_when_a_task_is_abandoned(tmp_path: Path
     )
     database.conn.execute(
         "UPDATE tasks SET state = ?, notes = ? WHERE id = ?",
-        ("PLAN_PROMOTED", "human rejection survives", kept_task.id),
+        ("PROMOTED", "human rejection survives", kept_task.id),
     )
     database.conn.commit()
     assert database.mark_abandoned(kept_task.id).notes == "human rejection survives"

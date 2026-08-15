@@ -15,12 +15,14 @@ from pathlib import Path
 
 import pytest
 
+from lazyfish.authority import CALL_SITE_ARCHITECT
 from lazyfish.db import (
     STATE_ABANDONED,
+    STATE_APPROVED,
+    STATE_AWAITING_ARTIFACT,
+    STATE_COMPLETED,
     STATE_ESCALATED,
-    STATE_PLAN_APPROVED,
-    STATE_PLAN_PROMOTED,
-    STATE_READY_FOR_PLAN,
+    STATE_PROMOTED,
     STATE_REJECTED,
     Database,
 )
@@ -77,7 +79,7 @@ def database(tmp_path: Path) -> Database:
     return instance
 
 
-def a_task(database: Database, *, state: str = STATE_READY_FOR_PLAN, **columns: object):
+def a_task(database: Database, *, state: str = STATE_AWAITING_ARTIFACT, **columns: object):
     """A task row forced into a given state, without running the flow to reach it.
 
     R5 asks for the per-ticket budget to be verified with a constructed state
@@ -137,9 +139,9 @@ def test_the_two_escalation_reasons_are_distinguishable() -> None:
 
 def test_waiting_for_a_human_is_not_an_escalation_reason() -> None:
     """AC5's note: an approval gate is a standing door, not an exception."""
-    assert STATE_ESCALATED != STATE_PLAN_PROMOTED
-    assert REASON_STAGE_BUDGET != STATE_PLAN_PROMOTED
-    assert REASON_TICKET_BUDGET != STATE_PLAN_PROMOTED
+    assert STATE_ESCALATED != STATE_PROMOTED
+    assert REASON_STAGE_BUDGET != STATE_PROMOTED
+    assert REASON_TICKET_BUDGET != STATE_PROMOTED
     assert BLOCKED_ON_HUMAN_APPROVAL != BLOCKED_ON_ESCALATION
 
 
@@ -153,7 +155,7 @@ def test_a_clean_plan_is_promoted() -> None:
         artifact_id=AN_ARTIFACT_ID, issues=[], stage_attempts=1, ticket_attempts=1
     )
     assert decision.promoted is True
-    assert decision.next_state == STATE_PLAN_PROMOTED
+    assert decision.next_state == STATE_PROMOTED
     assert decision.rejection is None
     assert decision.escalation_reason is None
 
@@ -164,7 +166,7 @@ def test_a_clean_plan_is_promoted_even_late_in_the_budget() -> None:
         artifact_id=AN_ARTIFACT_ID, issues=[], stage_attempts=9, ticket_attempts=20
     )
     assert decision.promoted is True
-    assert decision.next_state == STATE_PLAN_PROMOTED
+    assert decision.next_state == STATE_PROMOTED
 
 
 def test_a_failing_plan_is_rejected_and_routed_back() -> None:
@@ -353,7 +355,7 @@ def test_a_rejection_names_the_artifact_it_rejected_not_the_task() -> None:
 
 
 def test_a_prepared_task_can_be_promoted() -> None:
-    ensure_promotable(STATE_READY_FOR_PLAN)
+    ensure_promotable(STATE_AWAITING_ARTIFACT)
 
 
 def test_a_rejected_task_can_be_promoted_again() -> None:
@@ -363,7 +365,7 @@ def test_a_rejected_task_can_be_promoted_again() -> None:
 
 @pytest.mark.parametrize(
     "state",
-    [STATE_ESCALATED, STATE_PLAN_APPROVED, STATE_ABANDONED],
+    [STATE_ESCALATED, STATE_APPROVED, STATE_ABANDONED],
 )
 def test_states_that_cannot_be_promoted_say_so(state: str) -> None:
     with pytest.raises(StateError):
@@ -381,7 +383,7 @@ def test_next_step_on_a_prepared_task_names_the_stage_and_the_workspace(
     step = next_step(a_task(database))
     assert step.stage == STAGE_ARCHITECT
     assert step.workspace == "/tmp/worktrees/work/PROJ-1/architect"
-    assert step.state == STATE_READY_FOR_PLAN
+    assert step.state == STATE_AWAITING_ARTIFACT
     assert step.blocked_on is None
 
 
@@ -398,8 +400,8 @@ def test_a_rejected_task_is_sent_round_again(database: Database) -> None:
 
 
 def test_a_promoted_plan_stops_the_loop_for_approval(database: Database) -> None:
-    """D10: PLAN_PROMOTED is a terminal state for a runner, by construction."""
-    step = next_step(a_task(database, state=STATE_PLAN_PROMOTED))
+    """D10: the promoted state is terminal for a runner, by construction."""
+    step = next_step(a_task(database, state=STATE_PROMOTED))
     assert step.stage is None
     assert step.blocked_on == BLOCKED_ON_HUMAN_APPROVAL
 
@@ -410,7 +412,7 @@ def test_an_escalated_task_stops_the_loop_for_a_different_reason(database: Datab
     assert step.blocked_on == BLOCKED_ON_ESCALATION
 
 
-@pytest.mark.parametrize("state", [STATE_PLAN_APPROVED, STATE_ABANDONED])
+@pytest.mark.parametrize("state", [STATE_APPROVED, STATE_ABANDONED])
 def test_a_finished_task_has_no_next_stage(database: Database, state: str) -> None:
     step = next_step(a_task(database, state=state))
     assert step.stage is None
@@ -465,3 +467,98 @@ def test_a_constructed_state_is_really_stored(database: Database) -> None:
     assert task.state == STATE_ESCALATED
     assert task.attempt == 4
     assert task.ticket_attempts == 4
+
+
+# --------------------------------------------------------------------------- #
+# LF-7: a stage is data
+# --------------------------------------------------------------------------- #
+
+
+def test_adding_a_stage_does_not_touch_the_state_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4, the key property made executable rather than argued.
+
+    Inserting a stage into the sequence has to be the whole change. If this test
+    ever needs `LEGAL_TRANSITIONS` or a new state to pass, LF-7 did not achieve
+    what it was for.
+    """
+    from lazyfish import orchestrator
+    from lazyfish.db import LEGAL_TRANSITIONS
+
+    edges_before = {state: frozenset(targets) for state, targets in LEGAL_TRANSITIONS.items()}
+
+    monkeypatch.setattr(
+        orchestrator, "STAGE_SEQUENCE", (CALL_SITE_ARCHITECT, "tester@write", "coder")
+    )
+
+    assert orchestrator.next_stage(CALL_SITE_ARCHITECT) == "tester@write"
+    assert orchestrator.next_stage("tester@write") == "coder"
+    assert orchestrator.next_stage("coder") is None
+
+    assert orchestrator.advance_stage(CALL_SITE_ARCHITECT) == (
+        "tester@write",
+        STATE_AWAITING_ARTIFACT,
+    )
+    assert orchestrator.advance_stage("coder") == (None, STATE_COMPLETED)
+
+    assert {state: frozenset(t) for state, t in LEGAL_TRANSITIONS.items()} == edges_before
+
+
+def test_reordering_the_sequence_is_the_whole_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Tester has already been moved once, while this was still on paper."""
+    from lazyfish import orchestrator
+
+    monkeypatch.setattr(
+        orchestrator, "STAGE_SEQUENCE", (CALL_SITE_ARCHITECT, "coder", "tester@write")
+    )
+    assert orchestrator.next_stage(CALL_SITE_ARCHITECT) == "coder"
+
+    monkeypatch.setattr(
+        orchestrator, "STAGE_SEQUENCE", (CALL_SITE_ARCHITECT, "tester@write", "coder")
+    )
+    assert orchestrator.next_stage(CALL_SITE_ARCHITECT) == "tester@write"
+
+
+def test_a_stage_this_build_does_not_know_has_no_successor() -> None:
+    """A database written by a build whose sequence had something extra."""
+    from lazyfish.orchestrator import advance_stage, next_stage
+
+    assert next_stage("reviewer@vibes") is None
+    assert advance_stage("reviewer@vibes") == (None, STATE_COMPLETED)
+
+
+def test_only_the_architect_has_a_human_gate() -> None:
+    """AC5's other half: approval is a property of the call site (LF-7 D4)."""
+    from lazyfish.authority import CALL_SITES
+    from lazyfish.orchestrator import requires_approval
+
+    assert requires_approval(CALL_SITE_ARCHITECT)
+    for name in CALL_SITES:
+        if name != CALL_SITE_ARCHITECT:
+            assert not requires_approval(name), name
+    assert not requires_approval(None)
+
+
+def test_the_first_stage_agrees_with_the_sequence() -> None:
+    """db.py names the starting stage because it cannot import the sequence."""
+    from lazyfish.db import STAGE_SEQUENCE_START
+    from lazyfish.orchestrator import STAGE_SEQUENCE
+
+    assert STAGE_SEQUENCE_START == STAGE_SEQUENCE[0]
+
+
+def test_next_step_reads_the_stage_from_the_task_not_from_the_state(
+    database: Database,
+) -> None:
+    """LF-7 D2: the same state at two stages yields two different answers."""
+    from lazyfish.orchestrator import next_step
+
+    task = a_task(database)
+    assert next_step(task).stage == CALL_SITE_ARCHITECT
+
+    database.conn.execute("UPDATE tasks SET current_stage = 'coder' WHERE id = ?", (task.id,))
+    database.conn.commit()
+    moved = database.get(task.id)
+    assert moved is not None
+    assert next_step(moved).stage == "coder"
+    # And the read surface follows the stage, from the authority table.
+    assert next_step(moved).consumes == ("TechnicalPlan", "TestArtifact")

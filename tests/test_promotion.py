@@ -28,10 +28,11 @@ from lazyfish.cli import cli
 from lazyfish.db import (
     APPROVAL_INTERACTIVE,
     APPROVAL_NON_INTERACTIVE,
+    STATE_APPROVED,
+    STATE_AWAITING_ARTIFACT,
+    STATE_COMPLETED,
     STATE_ESCALATED,
-    STATE_PLAN_APPROVED,
-    STATE_PLAN_PROMOTED,
-    STATE_READY_FOR_PLAN,
+    STATE_PROMOTED,
     STATE_REJECTED,
     Database,
 )
@@ -54,6 +55,7 @@ from .conftest import (
     implement_the_whole_ticket,
     make_plan,
     make_ticket,
+    open_database,
     stored_artifact_files,
     stored_content,
     task_of,
@@ -159,7 +161,7 @@ def test_a_workspace_that_implemented_the_whole_ticket_still_promotes(
 
     result = runner.invoke(cli, ["promote"])
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert task_of(env).state == STATE_PLAN_PROMOTED
+    assert task_of(env).state == STATE_PROMOTED
 
 
 def test_the_promoted_artifact_is_the_plan_and_only_the_plan(
@@ -309,7 +311,7 @@ def test_accept_cannot_approve_a_plan_that_failed_the_contract(
     assert result.exit_code == 6
 
     task = task_of(env)
-    assert task.state != STATE_PLAN_APPROVED
+    assert task.state != STATE_APPROVED
     assert task.plan_accepted is None
     assert promoted_plan(env, task.id) is None
 
@@ -547,7 +549,7 @@ def test_repeated_rejections_escalate_and_keep_the_last_one(
 def test_an_escalated_ticket_is_not_promoted_again(
     prepared_worktree: tuple[dict[str, Path], Path, FakeTracker], runner: CliRunner
 ) -> None:
-    """The illegal jump the plan names: ESCALATED straight to PLAN_PROMOTED."""
+    """The illegal jump the plan names: ESCALATED straight to promoted."""
     env, worktree, _ = prepared_worktree
     for attempt in range(4):
         write_plan(worktree, needs_human=False, understanding=f"attempt {attempt}")
@@ -589,8 +591,8 @@ def test_promote_stops_at_awaiting_approval(
     assert runner.invoke(cli, ["promote"]).exit_code == 0
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_PROMOTED
-    assert task.state != STATE_PLAN_APPROVED
+    assert task.state == STATE_PROMOTED
+    assert task.state != STATE_APPROVED
     assert task.plan_accepted is None
     assert task.accepted_at is None
 
@@ -607,7 +609,7 @@ def test_approval_after_promotion_reaches_plan_approved(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_APPROVED
+    assert task.state == STATE_COMPLETED
     assert task.plan_accepted is True
 
 
@@ -622,7 +624,7 @@ def test_accept_still_works_in_one_step(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_APPROVED
+    assert task.state == STATE_COMPLETED
     assert promoted_plan(env, task.id) is not None
 
 
@@ -642,7 +644,7 @@ def test_promoting_the_same_plan_twice_changes_nothing(
     assert first is not None and second is not None
     assert first.id == second.id
     assert len(stored_artifact_files(env, task.id)) == 1
-    assert task_of(env).state == STATE_PLAN_PROMOTED
+    assert task_of(env).state == STATE_PROMOTED
 
 
 def test_a_rewritten_plan_can_be_promoted_after_a_rejection(
@@ -656,7 +658,7 @@ def test_a_rewritten_plan_can_be_promoted_after_a_rejection(
 
     write_plan(worktree)
     assert runner.invoke(cli, ["promote"]).exit_code == 0
-    assert task_of(env).state == STATE_PLAN_PROMOTED
+    assert task_of(env).state == STATE_PROMOTED
     assert task_of(env).attempt == 2
 
 
@@ -770,7 +772,7 @@ def test_a_modified_approval_is_also_non_interactive(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_APPROVED
+    assert task.state == STATE_COMPLETED
     assert task.plan_accepted is False
     assert task.notes == "added a migration step"
     assert task.approved_via == APPROVAL_NON_INTERACTIVE
@@ -808,7 +810,7 @@ def test_choosing_as_is_approves_the_plan_unchanged(
     assert runner.invoke(cli, ["accept"], input=f"{ANSWER_AS_IS}\n").exit_code == 0
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_APPROVED
+    assert task.state == STATE_COMPLETED
     assert task.plan_accepted is True
 
 
@@ -818,7 +820,7 @@ def test_choosing_modified_approves_the_plan_and_keeps_the_note(
     """AC15, second exit - the bucket LF-1 AC10 measures, reached interactively.
 
     This is the path revision 3 would have destroyed: the answer that means "I
-    accepted it, after changing it" has to keep landing in PLAN_APPROVED with
+    accepted it, after changing it" has to keep landing in the approved bucket with
     plan_accepted false, not in the rejection path.
     """
     env, worktree, _ = prepared_worktree
@@ -827,7 +829,7 @@ def test_choosing_modified_approves_the_plan_and_keeps_the_note(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_APPROVED
+    assert task.state == STATE_COMPLETED
     assert task.plan_accepted is False
     assert task.notes == "missed the rate limiter"
     assert task.approved_via == APPROVAL_INTERACTIVE
@@ -845,7 +847,7 @@ def test_choosing_reject_sends_the_plan_back_to_the_architect(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_READY_FOR_PLAN
+    assert task.state == STATE_AWAITING_ARTIFACT
     assert task.plan_accepted is None
     assert task.attempt == 1
     assert "missed the rate limiter" in (task.notes or "")
@@ -861,7 +863,7 @@ def test_the_reject_flag_is_the_non_interactive_form(
     assert result.exit_code == 0, result.stdout + result.stderr
 
     task = task_of(env)
-    assert task.state == STATE_READY_FOR_PLAN
+    assert task.state == STATE_AWAITING_ARTIFACT
     assert task.plan_accepted is None
     assert task.attempt == 1
     assert rejection_content(env, task.id)["source"] == SOURCE_HUMAN
@@ -886,7 +888,7 @@ def test_the_three_flags_contradict_each_other(
     write_plan(worktree)
     result = runner.invoke(cli, ["accept", *flags])
     assert result.exit_code != 0
-    assert task_of(env).state == STATE_READY_FOR_PLAN
+    assert task_of(env).state == STATE_AWAITING_ARTIFACT
 
 
 def test_force_cannot_be_combined_with_reject(
@@ -906,7 +908,7 @@ def test_force_cannot_be_combined_with_reject(
 
     result = runner.invoke(cli, ["accept", "--reject", "--force", "--note", "start again"])
     assert result.exit_code != 0
-    assert task_of(env).state == STATE_READY_FOR_PLAN
+    assert task_of(env).state == STATE_AWAITING_ARTIFACT
     assert task_of(env).attempt == 0
     assert rejections(env, task_of(env).id) == []
 
@@ -953,7 +955,7 @@ def test_a_plan_rewritten_after_a_human_rejection_can_be_approved(
     assert runner.invoke(cli, ["accept", "--as-is"]).exit_code == 0
 
     task = task_of(env)
-    assert task.state == STATE_PLAN_APPROVED
+    assert task.state == STATE_COMPLETED
     assert task.plan_accepted is True
     assert task.attempt == 2
 
@@ -1020,7 +1022,7 @@ def test_promote_in_json_is_only_json(
 
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
-    assert payload["state"] == STATE_PLAN_PROMOTED
+    assert payload["state"] == STATE_PROMOTED
     assert payload["rejection"] is None
     assert payload["artifact"]["id"] == promoted_plan(env, task_of(env).id).id
     assert payload["artifact"]["type"] == TYPE_TECHNICAL_PLAN
@@ -1049,7 +1051,7 @@ def test_a_runner_can_drive_one_stage_with_json_alone(
     step = json.loads(runner.invoke(cli, ["next", "--json"]).stdout)
     assert step["stage"] is None
     assert step["blocked_on"] == BLOCKED_ON_HUMAN_APPROVAL
-    assert step["state"] == STATE_PLAN_PROMOTED
+    assert step["state"] == STATE_PROMOTED
 
 
 def test_a_runner_is_told_when_a_ticket_escalated(
@@ -1113,3 +1115,51 @@ def test_three_preps_still_record_one_baseline(
     rows = tasks_of(configured)
     assert len(rows) == 1
     assert rows[0].base_commit == head_commit(repo)
+
+
+def test_accept_is_refused_at_a_stage_with_no_human_gate(
+    prepared_worktree: tuple[dict[str, Path], Path, object],
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5: approving where nobody approves would be recorded in silence.
+
+    The row it would leave -- APPROVED, plan_accepted set, at a stage with no
+    gate -- is indistinguishable from a real approval in the as-is rate, and no
+    rule anywhere is broken by it. That is why the check exists (LF-7 D4).
+    """
+    env, worktree, _ = prepared_worktree
+    write_plan(worktree)
+
+    with open_database(env) as database:
+        task = database.get_live("work")[0]
+        database.conn.execute("UPDATE tasks SET current_stage = 'coder' WHERE id = ?", (task.id,))
+        database.conn.commit()
+
+    result = runner.invoke(cli, ["accept", "--as-is"])
+    assert result.exit_code != 0
+    assert "coder" in result.output
+    assert "promote" in result.output
+
+    with open_database(env) as database:
+        unchanged = database.get(task.id)
+    assert unchanged is not None
+    assert unchanged.plan_accepted is None
+    assert unchanged.accepted_at is None
+
+
+def test_the_attempt_count_survives_completion(
+    prepared_worktree: tuple[dict[str, Path], Path, object], runner: CliRunner
+) -> None:
+    """AC6's other side: clearing `attempt` at the end erases what it measured."""
+    env, worktree, _ = prepared_worktree
+    write_plan(worktree, assumptions=[])
+    assert runner.invoke(cli, ["promote"]).exit_code != 0
+
+    write_plan(worktree)
+    assert runner.invoke(cli, ["accept", "--as-is"]).exit_code == 0
+
+    task = task_of(env)
+    assert task.state == STATE_COMPLETED
+    assert task.attempt == 2
+    assert task.ticket_attempts == 2

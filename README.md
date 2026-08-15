@@ -459,6 +459,21 @@ current directory, not a parent, not the repository.
 Check the variable first; if the path is right, move the file aside and lazyfish
 will create a new database. Only the recorded tickets are lost.
 
+**"was written by a newer lazyfish".** The database carries a schema version,
+and lazyfish will not write to a file a later build has already upgraded — a
+build that does not know a column cannot maintain it. Upgrading this install is
+the fix.
+
+You only see this with **two machines sharing one data directory**, and then the
+order matters: whichever upgrades first migrates the database, and the other is
+turned away until it upgrades too. Two machines with their own databases — the
+default, since it lives in `~/.local/share/lazyfish/` — each migrate their own
+copy and never meet.
+
+Migrations run by themselves, on the first command after an upgrade. They are
+idempotent, they only translate values lazyfish itself wrote, and tickets in
+flight keep their worktrees, branches and baselines. Nothing is asked of you.
+
 **"Branch lazyfish/KEY is already checked out by profile X".** Two profiles
 matched the same ticket in the same repository. Worktrees are per profile,
 branches are not. Give one profile its own `branch_prefix`, or finish the ticket

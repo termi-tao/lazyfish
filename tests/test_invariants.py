@@ -65,7 +65,7 @@ _IMPORT = re.compile(r"^\s*(?:import|from)\s+([A-Za-z_][\w.]*)", re.MULTILINE)
 # :1075). A fixed allowlist rather than a pattern, so that learning any of the
 # states LF-5 adds - PLAN_PROMOTED, REJECTED, ESCALATED - fails here. If the CLI
 # needs to show one of those, the label comes from the orchestrator (D13).
-CLI_DISPLAY_STATES = frozenset({"STATE_ABANDONED", "STATE_READY_FOR_PLAN"})
+CLI_DISPLAY_STATES = frozenset({"STATE_ABANDONED", "STATE_AWAITING_ARTIFACT"})
 
 # Latin Extended-B ends at U+024F. Anything above it is another script, with a
 # few punctuation marks that legitimately appear in prose.
@@ -296,7 +296,7 @@ def test_the_cli_makes_no_transition_judgement() -> None:
     "snippet",
     [
         "from .db import check_transition\ncheck_transition(task.state, STATE_ABANDONED)\n",
-        "from .db import STATE_PLAN_PROMOTED\n",
+        "from .db import STATE_PROMOTED\n",
         "from lazyfish.db import STATE_ABANDONED, STATE_ESCALATED\n",
         "from .db import STATE_REJECTED as WAITING\n",
     ],
@@ -313,10 +313,10 @@ def test_transition_judgement_scanner_allows_display_use() -> None:
     criterion is what comes out of db.py, not what a name looks like.
     """
     allowed = (
-        "from .db import STATE_ABANDONED, STATE_READY_FOR_PLAN, Database\n"
+        "from .db import STATE_ABANDONED, STATE_AWAITING_ARTIFACT, Database\n"
         "from .workspace import STATE_DIRNAME\n"
         "rows = [task for task in tasks if task.state != STATE_ABANDONED]\n"
-        "label = 'waiting' if task.state == STATE_READY_FOR_PLAN else 'recorded'\n"
+        "label = 'waiting' if task.state == STATE_AWAITING_ARTIFACT else 'recorded'\n"
     )
     assert find_transition_judgement(allowed) == []
 
@@ -347,6 +347,11 @@ RETIRED_PATTERNS = {
     # shape has an underscore or a leading dash to match on.
     "[tracker]": re.compile(r"\[tracker\]"),
     "repo profile": re.compile(r"repo profile"),
+    # Added by LF-7. A rename that misses one occurrence produces no error at
+    # all: the old name simply stops matching anything, on whichever rare path
+    # still spells it. tests/test_migration.py is the one file that must keep
+    # them, because translating them is what it tests.
+    "old state names": re.compile(r"READY_FOR_PLAN|PLAN_PROMOTED|PLAN_APPROVED"),
 }
 
 
@@ -375,20 +380,32 @@ def repository_text_files() -> list[Path]:
     )
 
 
+RETIRED_ON_PURPOSE = "retired-vocabulary: on purpose"
+"""Marker for the one legitimate reason to write a retired name: translating it.
+
+A migration table has to name what it translates, and a fixture built from an
+old schema has to be built from the old schema. Both are the opposite of a
+missed rename, so they say so on the line rather than exempting a whole file --
+exempting the file would stop guarding everything else in it.
+"""
+
+
 @pytest.mark.parametrize("label", sorted(RETIRED_PATTERNS))
 def test_no_trace_of_the_old_configuration_model(label: str) -> None:
     """AC10: an incomplete rename hides until an unusual code path runs (R3).
 
     The old names are gone from the whole repository, not merely from the code
     paths the other tests happen to exercise. This file names them, so it
-    excludes itself.
+    excludes itself, and so does the migration's own test.
     """
     pattern = RETIRED_PATTERNS[label]
     hits = []
     for path in repository_text_files():
-        if path.name == "test_invariants.py":
+        if path.name in ("test_invariants.py", "test_migration.py"):
             continue
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if RETIRED_ON_PURPOSE in line:
+                continue
             if pattern.search(line):
                 hits.append(f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}")
     assert hits == [], f"'{label}' still present:\n" + "\n".join(hits)

@@ -501,7 +501,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_in_flight_profile
-    ON tasks (profile) WHERE state = 'READY_FOR_PLAN';
+    ON tasks (profile) WHERE state = 'READY_FOR_PLAN';  -- retired-vocabulary: on purpose
 
 CREATE INDEX IF NOT EXISTS ix_tasks_ticket ON tasks (ticket_key, profile);
 """
@@ -520,7 +520,7 @@ LEGACY_ROWS = (
     ("CS-233", "Second tool test", "spendwatt", "ABANDONED"),
     ("CS-291", "Third tool test", "spendwatt", "ABANDONED"),
     ("CS-344", "Fourth tool test", "spendwatt", "ABANDONED"),
-    ("CS-370", "The ticket still in flight", "spendwatt", "READY_FOR_PLAN"),
+    ("CS-370", "The ticket still in flight", "spendwatt", "AWAITING_ARTIFACT"),
 )
 
 

@@ -11,8 +11,9 @@ import pytest
 from lazyfish import db as db_module
 from lazyfish.db import (
     STATE_ABANDONED,
-    STATE_PLAN_APPROVED,
-    STATE_READY_FOR_PLAN,
+    STATE_APPROVED,
+    STATE_AWAITING_ARTIFACT,
+    STATE_COMPLETED,
     Database,
     check_transition,
 )
@@ -24,7 +25,7 @@ from .conftest import LEGACY_ROWS, legacy_rows_of, write_legacy_database
 # file - which carries the pre-existing db tests - still collects while the
 # slice is being written; test_the_new_states_are_exported below is what checks
 # that db.py names them, and the other new test modules import them directly.
-STATE_PLAN_PROMOTED = "PLAN_PROMOTED"
+STATE_PROMOTED = "PROMOTED"
 STATE_REJECTED = "REJECTED"
 STATE_ESCALATED = "ESCALATED"
 
@@ -105,7 +106,7 @@ def test_initialise_is_idempotent(tmp_path: Path) -> None:
 
 def test_insert_and_read_back(database: Database) -> None:
     task = add(database)
-    assert task.state == STATE_READY_FOR_PLAN
+    assert task.state == STATE_AWAITING_ARTIFACT
     assert task.was_top_pick is True
     assert task.plan_accepted is None
     assert database.get_in_flight("work").id == task.id
@@ -130,9 +131,17 @@ def test_profiles_do_not_interfere(database: Database) -> None:
 
 def test_accept_records_the_outcome(database: Database) -> None:
     task = add(database)
-    force_state(database, task.id, STATE_PLAN_PROMOTED)
-    accepted = database.mark_accepted(task.id, plan_accepted=False, notes="missed a case")
-    assert accepted.state == STATE_PLAN_APPROVED
+    force_state(database, task.id, STATE_PROMOTED)
+    accepted = database.mark_accepted(
+        task.id,
+        plan_accepted=False,
+        next_stage=None,
+        next_state=STATE_COMPLETED,
+        notes="missed a case",
+    )
+    # Approving the last stage completes the ticket, which is where
+    # the old approved state used to sit when architect was the whole pipeline.
+    assert accepted.state == STATE_COMPLETED
     assert accepted.plan_accepted is False
     assert accepted.notes == "missed a case"
     assert accepted.accepted_at is not None
@@ -159,15 +168,19 @@ def test_abandoned_is_terminal(database: Database) -> None:
     task = add(database)
     database.mark_abandoned(task.id)
     with pytest.raises(StateError, match="terminal state"):
-        database.mark_accepted(task.id, plan_accepted=True)
+        database.mark_accepted(
+            task.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED
+        )
 
 
 def test_a_task_cannot_be_accepted_twice(database: Database) -> None:
     task = add(database)
-    force_state(database, task.id, STATE_PLAN_PROMOTED)
-    database.mark_accepted(task.id, plan_accepted=True)
+    force_state(database, task.id, STATE_PROMOTED)
+    database.mark_accepted(task.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED)
     with pytest.raises(StateError, match="Cannot move a task"):
-        database.mark_accepted(task.id, plan_accepted=True)
+        database.mark_accepted(
+            task.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +191,7 @@ def test_a_task_cannot_be_accepted_twice(database: Database) -> None:
 def test_the_new_states_are_exported() -> None:
     """Names, not literals: the CLI, the orchestrator and the tests share them."""
     for name, value in (
-        ("STATE_PLAN_PROMOTED", STATE_PLAN_PROMOTED),
+        ("STATE_PROMOTED", STATE_PROMOTED),
         ("STATE_REJECTED", STATE_REJECTED),
         ("STATE_ESCALATED", STATE_ESCALATED),
     ):
@@ -188,25 +201,25 @@ def test_the_new_states_are_exported() -> None:
 def test_check_transition_table() -> None:
     """The legal edges of the extended machine.
 
-    PLAN_APPROVED keeps its original name and meaning - the state after a person
-    approved - and PLAN_PROMOTED is inserted in front of it (Q2, trap 2).
+    Approval and promotion are separate states, in that order: LF-5 inserted the
+    promoted one in front of the approved one rather than renaming anything.
     """
-    check_transition(STATE_READY_FOR_PLAN, STATE_PLAN_PROMOTED)
-    check_transition(STATE_READY_FOR_PLAN, STATE_REJECTED)
-    check_transition(STATE_READY_FOR_PLAN, STATE_ESCALATED)
-    check_transition(STATE_REJECTED, STATE_PLAN_PROMOTED)
-    check_transition(STATE_REJECTED, STATE_READY_FOR_PLAN)
+    check_transition(STATE_AWAITING_ARTIFACT, STATE_PROMOTED)
+    check_transition(STATE_AWAITING_ARTIFACT, STATE_REJECTED)
+    check_transition(STATE_AWAITING_ARTIFACT, STATE_ESCALATED)
+    check_transition(STATE_REJECTED, STATE_PROMOTED)
+    check_transition(STATE_REJECTED, STATE_AWAITING_ARTIFACT)
     check_transition(STATE_REJECTED, STATE_ESCALATED)
-    check_transition(STATE_PLAN_PROMOTED, STATE_PLAN_APPROVED)
-    check_transition(STATE_PLAN_PROMOTED, STATE_READY_FOR_PLAN)
+    check_transition(STATE_PROMOTED, STATE_APPROVED)
+    check_transition(STATE_PROMOTED, STATE_AWAITING_ARTIFACT)
 
 
 @pytest.mark.parametrize(
     "state",
     [
-        STATE_READY_FOR_PLAN,
-        STATE_PLAN_PROMOTED,
-        STATE_PLAN_APPROVED,
+        STATE_AWAITING_ARTIFACT,
+        STATE_PROMOTED,
+        STATE_APPROVED,
         STATE_REJECTED,
         STATE_ESCALATED,
     ],
@@ -219,14 +232,14 @@ def test_abandon_is_reachable_from_every_state(state: str) -> None:
 def test_a_plan_cannot_be_approved_before_it_is_promoted() -> None:
     """AC13, last bullet. This is the edge LF-1 had and LF-5 removes."""
     with pytest.raises(StateError):
-        check_transition(STATE_READY_FOR_PLAN, STATE_PLAN_APPROVED)
+        check_transition(STATE_AWAITING_ARTIFACT, STATE_APPROVED)
     with pytest.raises(StateError):
-        check_transition(STATE_REJECTED, STATE_PLAN_APPROVED)
+        check_transition(STATE_REJECTED, STATE_APPROVED)
 
 
 def test_an_escalated_task_cannot_jump_forward() -> None:
     """The illegal path the plan names by hand."""
-    for target in (STATE_PLAN_PROMOTED, STATE_PLAN_APPROVED):
+    for target in (STATE_PROMOTED, STATE_APPROVED):
         with pytest.raises(StateError):
             check_transition(STATE_ESCALATED, target)
 
@@ -235,14 +248,16 @@ def test_a_promoted_plan_does_not_reach_the_second_slice() -> None:
     """AC13, second bullet: downstream transitions are refused while awaiting approval."""
     for target in ("TESTING", "IMPLEMENTING", "REVIEWING", "DONE"):
         with pytest.raises(StateError):
-            check_transition(STATE_PLAN_PROMOTED, target)
+            check_transition(STATE_PROMOTED, target)
 
 
 def test_terminal_and_backward_transitions_stay_refused() -> None:
     with pytest.raises(StateError):
-        check_transition(STATE_ABANDONED, STATE_PLAN_APPROVED)
+        check_transition(STATE_ABANDONED, STATE_APPROVED)
     with pytest.raises(StateError):
-        check_transition(STATE_PLAN_APPROVED, STATE_READY_FOR_PLAN)
+        # A finished ticket cannot go back to awaiting an artifact. APPROVED
+        # can, now that it means one stage's gate rather than the end.
+        check_transition(STATE_COMPLETED, STATE_AWAITING_ARTIFACT)
 
 
 def test_an_unknown_state_is_named_in_the_error() -> None:
@@ -252,19 +267,25 @@ def test_an_unknown_state_is_named_in_the_error() -> None:
 
 def test_append_note_keeps_the_existing_text(database: Database) -> None:
     task = add(database)
-    force_state(database, task.id, STATE_PLAN_PROMOTED)
-    database.mark_accepted(task.id, plan_accepted=False, notes="first")
+    force_state(database, task.id, STATE_PROMOTED)
+    database.mark_accepted(
+        task.id, plan_accepted=False, next_stage=None, next_state=STATE_COMPLETED, notes="first"
+    )
     updated = database.append_note(task.id, "schema bypassed")
     assert updated.notes == "first\nschema bypassed"
 
 
 def test_stats_group_by_profile(database: Database) -> None:
     first = add(database, "PROJ-1", profile="work")
-    force_state(database, first.id, STATE_PLAN_PROMOTED)
-    database.mark_accepted(first.id, plan_accepted=True)
+    force_state(database, first.id, STATE_PROMOTED)
+    database.mark_accepted(
+        first.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED
+    )
     second = add(database, "PROJ-2", profile="work")
-    force_state(database, second.id, STATE_PLAN_PROMOTED)
-    database.mark_accepted(second.id, plan_accepted=False, notes="changed")
+    force_state(database, second.id, STATE_PROMOTED)
+    database.mark_accepted(
+        second.id, plan_accepted=False, next_stage=None, next_state=STATE_COMPLETED, notes="changed"
+    )
     third = add(database, "WEB-1", profile="infra", top=False)
     database.mark_abandoned(third.id)
 
@@ -283,8 +304,10 @@ def test_stats_group_by_profile(database: Database) -> None:
 
 def test_average_minutes_to_accept(database: Database) -> None:
     task = add(database)
-    force_state(database, task.id, STATE_PLAN_PROMOTED)
-    accepted = database.mark_accepted(task.id, plan_accepted=True)
+    force_state(database, task.id, STATE_PROMOTED)
+    accepted = database.mark_accepted(
+        task.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED
+    )
 
     started = datetime.fromisoformat(accepted.prepared_at) - timedelta(minutes=30)
     database.conn.execute(
@@ -423,7 +446,7 @@ def test_the_in_flight_index_survives_the_migration(tmp_path: Path) -> None:
     """Trap 2: the guarantee is structural, and must stay structural.
 
     One live task per ticket, not one per profile (LF-6 D8/D9). The legacy data
-    has one READY_FOR_PLAN row, so after migration another ticket in that profile
+    has one row awaiting its artifact, so after migration another ticket there
     is accepted, and a second live copy of that same ticket is refused by the
     database itself.
 
@@ -447,7 +470,7 @@ def test_the_in_flight_index_survives_the_migration(tmp_path: Path) -> None:
                     "CS-370",
                     "a second live copy",
                     "spendwatt",
-                    STATE_PLAN_PROMOTED,
+                    STATE_PROMOTED,
                     "lazyfish/CS-370-again",
                     "/tmp/again",
                     "/tmp/again/artifacts",
@@ -468,8 +491,10 @@ def test_the_migrated_in_flight_row_can_still_be_worked_on(tmp_path: Path) -> No
         task = database.get_in_flight("spendwatt")
         assert task is not None
         assert task.ticket_key == "CS-370"
-        force_state(database, task.id, STATE_PLAN_PROMOTED)
-        approved = database.mark_accepted(task.id, plan_accepted=True)
-        assert approved.state == STATE_PLAN_APPROVED
+        force_state(database, task.id, STATE_PROMOTED)
+        approved = database.mark_accepted(
+            task.id, plan_accepted=True, next_stage=None, next_state=STATE_COMPLETED
+        )
+        assert approved.state == STATE_COMPLETED
     finally:
         database.close()
