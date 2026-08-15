@@ -507,7 +507,7 @@ def test_ticket_json_is_written_and_ignored_by_git(
 
 
 # --------------------------------------------------------------------------- #
-# AC4: several repo profiles
+# AC4: several profiles, each with its own repository
 # --------------------------------------------------------------------------- #
 
 
@@ -1089,3 +1089,64 @@ def test_images_and_oversized_files_are_left_in_the_tracker(
     context = (worktree_from(result.stdout) / "CLAUDE.md").read_text(encoding="utf-8")
     assert "screen.png" in context
     assert "not downloaded" in context
+
+
+def test_two_profiles_on_one_repo_are_told_why_the_branch_collides(
+    env: dict[str, Path], repo: Path, tracker: FakeTracker, runner: CliRunner
+) -> None:
+    """K3: git's own refusal names a path and no profile, which explains nothing."""
+    write_config(
+        env["config"],
+        profiles={
+            "work": {"repo": str(repo), "query": "project = PROJ"},
+            "infra": {"repo": str(repo), "query": "project = PROJ"},
+        },
+    )
+    write_credentials(
+        env["credentials"],
+        sections={
+            "work": {"email": "you@example.com", "api_token": "token-work"},
+            "infra": {"email": "you@example.com", "api_token": "token-infra"},
+        },
+    )
+    tracker.tickets = [make_ticket("PROJ-1")]
+
+    assert runner.invoke(cli, ["--profile", "work", "prep"]).exit_code == 0
+
+    collided = runner.invoke(cli, ["--profile", "infra", "prep"])
+    assert collided.exit_code != 0
+    message = collided.output
+    # Both profiles named, the branch named, and the key that separates them.
+    assert "work" in message and "infra" in message
+    assert "lazyfish/PROJ-1" in message
+    assert "branch_prefix" in message
+    assert "Traceback" not in message
+
+
+def test_a_second_profile_with_its_own_prefix_does_not_collide(
+    env: dict[str, Path], repo: Path, tracker: FakeTracker, runner: CliRunner
+) -> None:
+    """The fix the message suggests has to actually work."""
+    write_config(
+        env["config"],
+        profiles={
+            "work": {"repo": str(repo), "query": "project = PROJ"},
+            "infra": {
+                "repo": str(repo),
+                "query": "project = PROJ",
+                "branch_prefix": "lazyfish/infra/",
+            },
+        },
+    )
+    write_credentials(
+        env["credentials"],
+        sections={
+            "work": {"email": "you@example.com", "api_token": "token-work"},
+            "infra": {"email": "you@example.com", "api_token": "token-infra"},
+        },
+    )
+    tracker.tickets = [make_ticket("PROJ-1")]
+
+    assert runner.invoke(cli, ["--profile", "work", "prep"]).exit_code == 0
+    second = runner.invoke(cli, ["--profile", "infra", "prep"])
+    assert second.exit_code == 0, second.output

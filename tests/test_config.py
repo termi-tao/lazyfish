@@ -288,3 +288,97 @@ def test_world_readable_credentials_are_refused(env: dict[str, Path]) -> None:
 def test_mode_600_is_accepted(env: dict[str, Path]) -> None:
     write_credentials(env["credentials"], mode=0o600)
     assert resolve_credentials("work", env["credentials"]).api_token == "token-work"
+
+
+# --------------------------------------------------------------------------- #
+# --config and $LAZYFISH_CONFIG name the same thing (K1)
+# --------------------------------------------------------------------------- #
+#
+# These go through the CLI on purpose. The defect they cover could not be seen
+# from `resolve_credentials` alone: both halves were correct in isolation, and
+# only the wiring disagreed about which directory the file was in. Every other
+# test in this file relocates config with $LAZYFISH_CONFIG, which is the path
+# that always worked.
+
+
+def test_config_option_puts_credentials_where_the_next_command_reads_them(
+    env: dict[str, Path],
+    repo: Path,
+    tracker: object,
+    runner: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K1: init --config wrote the token to a directory nothing else looked in."""
+    from lazyfish.cli import cli
+
+    monkeypatch.delenv("LAZYFISH_CONFIG", raising=False)
+    alternate = tmp_path / "alternate" / "config.toml"
+
+    created = runner.invoke(
+        cli,
+        [
+            "--config",
+            str(alternate),
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--base-url",
+            "https://example.atlassian.net",
+            "--email",
+            "you@example.com",
+            "--api-token",
+            "token-work",
+            "--query",
+            "project = PROJ",
+            "--repository",
+            str(repo),
+            "--no-check",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+
+    # Written beside the config file it was told to use, and nowhere else.
+    assert (alternate.parent / "credentials").exists()
+    assert not env["credentials"].exists()
+
+    # The round trip: the same --config finds what init just wrote.
+    listed = runner.invoke(cli, ["--config", str(alternate), "list"])
+    assert listed.exit_code == 0, listed.output
+
+
+def test_config_env_var_still_locates_credentials_beside_it(
+    env: dict[str, Path],
+    repo: Path,
+    tracker: object,
+    runner: object,
+) -> None:
+    """The half that was already right stays right."""
+    from lazyfish.cli import cli
+
+    created = runner.invoke(
+        cli,
+        [
+            "init",
+            "--yes",
+            "--profile",
+            "work",
+            "--base-url",
+            "https://example.atlassian.net",
+            "--email",
+            "you@example.com",
+            "--api-token",
+            "token-work",
+            "--query",
+            "project = PROJ",
+            "--repository",
+            str(repo),
+            "--no-check",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+    assert env["credentials"].exists()
+
+    listed = runner.invoke(cli, ["list"])
+    assert listed.exit_code == 0, listed.output

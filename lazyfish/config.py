@@ -292,7 +292,7 @@ def _scan_for_credentials(data: Mapping[str, object], source: Path) -> None:
                 location = ".".join(trail)
                 raise ConfigError(
                     f"Possible credential found in {source} at '{location}': {reason}.\n"
-                    f"Credentials belong in {credentials_path()}, which is never "
+                    f"Credentials belong in {credentials_path(source)}, which is never "
                     f"shared and is kept at mode 600:\n"
                     f"    [<profile name>]\n"
                     f'    email     = "you@example.com"\n'
